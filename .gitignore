@@ -1,0 +1,4 @@
+target/
+api/node_modules/
+api/dist/
+*.log
