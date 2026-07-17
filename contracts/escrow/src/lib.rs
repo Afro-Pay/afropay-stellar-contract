@@ -1,6 +1,9 @@
 #![no_std]
 use soroban_sdk::{contract, contracttype, Address, Env, Map, Vec, String, panic};
 
+pub mod migration;
+use migration::{EscrowMigrationError, migrate as run_migrate};
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EscrowState {
@@ -144,6 +147,35 @@ impl EscrowContract {
         env.storage()
             .get(&id)
             .unwrap_or_else(|| panic!("Escrow not found"))
+    }
+
+    /// Initialise the contract and set the admin address.
+    ///
+    /// Must be called once after deployment before any other entry point.
+    /// Sets the initial schema version so that `migrate()` has a baseline.
+    pub fn initialize(env: Env, admin: Address) {
+        if env.storage().instance().has(&soroban_sdk::Symbol::new(&env, migration::KEY_ADMIN)) {
+            panic!("Already initialised");
+        }
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::Symbol::new(&env, migration::KEY_ADMIN), &admin);
+        migration::set_initial_schema_version(&env);
+    }
+
+    /// Apply pending schema migrations after a WASM upgrade.
+    ///
+    /// Callable only by the contract admin.  Idempotent — calling it when
+    /// already at the target version returns without side effects.
+    ///
+    /// # Errors
+    ///
+    /// - [`EscrowMigrationError::AdminNotSet`] if `initialize()` has not been called.
+    /// - [`EscrowMigrationError::Unauthorized`] if `admin` is not the stored admin.
+    /// - [`EscrowMigrationError::VersionDowngrade`] if stored version > target.
+    /// - [`EscrowMigrationError::UnknownSchemaVersion`] for unrecognised transitions.
+    pub fn migrate(env: Env, admin: Address) -> Result<(), EscrowMigrationError> {
+        run_migrate(&env, admin)
     }
 
     /// Validate state transition
