@@ -1,4 +1,2 @@
 target/
-api/node_modules/
-api/dist/
-*.log
+Cargo.lock

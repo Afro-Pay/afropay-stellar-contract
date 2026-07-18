@@ -1,0 +1,13 @@
+[package]
+name = "aml"
+version = "0.1.0"
+edition = "2021"
+description = "Rule-based AML/CFT transaction monitoring engine and NFIU SAR export for AfroPay"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+[dev-dependencies]
+jsonschema = "0.18"

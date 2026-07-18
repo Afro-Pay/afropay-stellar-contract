@@ -1,0 +1,73 @@
+name: Feature Request
+description: Propose a new feature, corridor, or integration
+title: "[Feature]: "
+labels: ["enhancement", "needs-triage"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the suggestion! Please describe your idea clearly so the team and community can evaluate it.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / Motivation
+      description: What problem does this feature solve? Who benefits and how?
+      placeholder: "Senders to Kenya must manually convert KES to USDC before depositing. A native KES corridor would remove this step."
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: Describe the change you'd like to see.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      multiple: true
+      options:
+        - "Smart contract — RemittanceContract (src/)"
+        - "Smart contract — EscrowContract (contracts/escrow/)"
+        - "Oracle / attestation protocol"
+        - "New remittance corridor"
+        - "Migration / upgrade framework"
+        - "CI / developer tooling"
+        - "Documentation"
+        - "Architecture (requires ADR)"
+        - "Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: What other approaches did you consider and why did you rule them out?
+    validations:
+      required: false
+
+  - type: dropdown
+    id: adr
+    attributes:
+      label: Does this require an Architecture Decision Record?
+      description: See [docs/adr/README.md](../../docs/adr/README.md) for guidance.
+      options:
+        - "Yes — this is an architectural change"
+        - "No — this is an implementation detail"
+        - "Not sure"
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: Links, references, prior art, related issues, etc.
+    validations:
+      required: false
