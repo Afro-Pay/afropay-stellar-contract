@@ -1,0 +1,44 @@
+# AfroPay stellar.toml — SEP-1 anchor discovery document.
+#
+# Served at https://<home-domain>/.well-known/stellar.toml with
+# Content-Type: text/plain and CORS enabled (see api/app.ts).
+#
+# NOTE: AfroPay is currently in its testnet phase (see README deployment
+# strategy), so NETWORK_PASSPHRASE is the testnet passphrase and SIGNING_KEY
+# is a testnet-only key. Both MUST be rotated for the mainnet launch.
+#
+# When the API runs locally or in CI (HOME_DOMAIN env override set), the
+# server rewrites the endpoint origins and SIGNING_KEY at serve time so the
+# published document always matches the running instance.
+
+VERSION = "2.7.0"
+NETWORK_PASSPHRASE = "Test SDF Network ; September 2015"
+SIGNING_KEY = "GAARSMO3C7RNFUQQ5V4CQD2RREGWAKTK3YFRDPVNGCDWZ5ISCEGEAJDC"
+ACCOUNTS = ["GAARSMO3C7RNFUQQ5V4CQD2RREGWAKTK3YFRDPVNGCDWZ5ISCEGEAJDC"]
+
+WEB_AUTH_ENDPOINT = "https://api.afropay.io/auth"
+KYC_SERVER = "https://api.afropay.io/kyc"
+DIRECT_PAYMENT_SERVER = "https://api.afropay.io/sep31"
+
+[DOCUMENTATION]
+ORG_NAME = "AfroPay"
+ORG_URL = "https://afropay.io"
+ORG_DESCRIPTION = "Decentralized cross-border remittance platform on Stellar, focused on Africa and emerging markets."
+ORG_LOGO = "https://afropay.io/logo.png"
+ORG_SUPPORT_EMAIL = "dev@afropay.io"
+ORG_TWITTER = "AfroPay"
+
+[[PRINCIPALS]]
+name = "AfroPay Engineering"
+email = "dev@afropay.io"
+
+[[CURRENCIES]]
+code = "USDC"
+issuer = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+status = "test"
+display_decimals = 2
+name = "USD Coin"
+desc = "Circle-issued USD Coin on the Stellar test network. AfroPay's settlement asset for cross-border remittances."
+is_asset_anchored = true
+anchor_asset_type = "fiat"
+anchor_asset = "USD"

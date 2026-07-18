@@ -1,0 +1,69 @@
+name: SEP Compliance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate-stellar-toml:
+    name: Validate stellar.toml (SEP-1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+      - name: Install API dependencies
+        run: npm ci --prefix api
+      - name: Validate stellar.toml
+        run: node scripts/validate-stellar-toml.mjs
+
+  anchor-tests:
+    name: Stellar anchor-tests (SEP-1, 10, 12, 31)
+    runs-on: ubuntu-latest
+    env:
+      # CI-only Stellar keypair. It matches the SIGNING_KEY committed in
+      # public/.well-known/stellar.toml, exists solely so anchor-tests can
+      # verify challenge signatures, and must NEVER hold funds or be used
+      # outside CI. Production deployments provide their own seed via a
+      # secret manager.
+      SEP10_SIGNING_SEED: SAPIZOWDFX4OYJNP2YYP7S3RWSGBWH5LSENWAI6PLQKULS3BKVXQ3MTQ
+      HOME_DOMAIN: localhost:8000
+      JWT_SECRET: ci-only-jwt-secret
+      PORT: "8000"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+      - name: Install API dependencies
+        run: npm ci --prefix api
+      - name: Build API
+        run: npm run build --prefix api
+      - name: Start anchor API
+        run: |
+          node api/dist/server.js &
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8000/.well-known/stellar.toml > /dev/null; then
+              echo "API is up"; exit 0
+            fi
+            sleep 1
+          done
+          echo "API failed to start"; exit 1
+      - name: Run stellar-anchor-tests (SEP 1, 10, 12, 31)
+        # SEP-10 signer tests fund throwaway accounts via testnet friendbot,
+        # which is occasionally flaky — retry once before failing the build.
+        run: |
+          run_tests() {
+            npx --yes @stellar/anchor-tests@0.6.22 \
+              --home-domain http://localhost:8000 \
+              --seps 1 10 12 31 \
+              --asset-code USDC \
+              --sep-config ci/anchor-tests-sep-config.json
+          }
+          run_tests || { echo "Retrying once (testnet friendbot flakiness)..."; run_tests; }

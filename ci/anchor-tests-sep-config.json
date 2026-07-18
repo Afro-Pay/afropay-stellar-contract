@@ -1,0 +1,38 @@
+{
+  "12": {
+    "customers": {
+      "toBeCreated": {
+        "first_name": "John",
+        "last_name": "Doe",
+        "email_address": "john@example.com"
+      },
+      "sendingClient": {
+        "first_name": "Allie",
+        "last_name": "Grater",
+        "email_address": "allie@example.com"
+      },
+      "receivingClient": {
+        "first_name": "Lee",
+        "last_name": "Sun",
+        "email_address": "lee@example.com"
+      },
+      "toBeDeleted": {
+        "first_name": "Jane",
+        "last_name": "Doe",
+        "email_address": "jane@example.com"
+      }
+    },
+    "createCustomer": "toBeCreated",
+    "deleteCustomer": "toBeDeleted",
+    "sameAccountDifferentMemos": ["sendingClient", "receivingClient"]
+  },
+  "31": {
+    "sendingAnchorClientSecret": "SBXI2CH22KRDQTAKRGKS6KPTHSB3OLFDSONGXFS4U6G2O6L3RNNB457C",
+    "sendingClientName": "sendingClient",
+    "receivingClientName": "receivingClient",
+    "transactionFields": {
+      "receiver_account_number": "0123456789",
+      "receiver_routing_number": "110000000"
+    }
+  }
+}
