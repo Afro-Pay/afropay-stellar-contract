@@ -11,5 +11,14 @@
     "resolveJsonModule": true,
     "sourceMap": true
   },
-  "include": ["server.ts", "app.ts", "config.ts", "store.ts", "routes/**/*.ts", "middleware/**/*.ts"]
+  "include": [
+    "server.ts",
+    "app.ts",
+    "config.ts",
+    "store.ts",
+    "routes/**/*.ts",
+    "middleware/**/*.ts",
+    "webhooks/**/*.ts",
+    "__tests__/**/*.ts"
+  ]
 }

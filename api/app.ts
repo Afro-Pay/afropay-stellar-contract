@@ -3,6 +3,8 @@ import { config } from "./config";
 import sep10Router from "./routes/sep10";
 import sep12Router from "./routes/sep12";
 import sep31Router from "./routes/sep31";
+import flutterwaveRouter from "./webhooks/flutterwave";
+import paystackRouter from "./webhooks/paystack";
 
 function mountPath(url: URL): string {
   return url.pathname.replace(/\/$/, "") || "/";
@@ -33,6 +35,10 @@ export function buildApp(): Express {
   app.use(mountPath(config.webAuthEndpoint), sep10Router);
   app.use(mountPath(config.kycServer), sep12Router);
   app.use(mountPath(config.directPaymentServer), sep31Router);
+
+  // Webhook receivers — Flutterwave (HMAC-SHA512) and Paystack (HMAC-SHA256)
+  app.use("/webhooks/flutterwave", flutterwaveRouter);
+  app.use("/webhooks/paystack", paystackRouter);
 
   return app;
 }
