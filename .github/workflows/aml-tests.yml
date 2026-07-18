@@ -1,0 +1,42 @@
+name: AML Engine Tests
+
+on:
+  pull_request:
+    paths:
+      - 'services/aml/**'
+      - 'docs/compliance/nfiu-sar-schema.json'
+  push:
+    paths:
+      - 'services/aml/**'
+      - 'docs/compliance/nfiu-sar-schema.json'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            services/aml/target
+          key: ${{ runner.os }}-cargo-aml-${{ hashFiles('services/aml/Cargo.lock') }}
+
+      - name: Run tests
+        run: |
+          cd services/aml
+          cargo test
+
+      - name: Clippy
+        run: |
+          cd services/aml
+          cargo clippy --all-targets -- -D warnings

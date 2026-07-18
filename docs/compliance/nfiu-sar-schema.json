@@ -1,0 +1,84 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://afropay.io/schemas/nfiu-sar-schema.json",
+  "title": "NFIU Suspicious Activity Report",
+  "description": "JSON schema for Suspicious Activity Reports filed with the Nigerian Financial Intelligence Unit (NFIU) under the CBN AML/CFT Regulations 2022.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "report_id",
+    "alert_id",
+    "filing_institution",
+    "reporting_officer",
+    "rule_triggered",
+    "severity",
+    "subject_name",
+    "subject_bvn",
+    "related_transaction_ids",
+    "total_amount_kobo",
+    "currency",
+    "narrative",
+    "date_of_activity",
+    "date_reported"
+  ],
+  "properties": {
+    "report_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Unique identifier for this SAR filing."
+    },
+    "alert_id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Identifier of the aml_alerts record that triggered this report."
+    },
+    "filing_institution": {
+      "type": "string",
+      "minLength": 1
+    },
+    "reporting_officer": {
+      "type": "string",
+      "minLength": 1
+    },
+    "rule_triggered": {
+      "type": "string",
+      "enum": ["structuring", "high_velocity", "sanctions_screening", "dormant_account"]
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["Low", "Medium", "High", "Critical"]
+    },
+    "subject_name": {
+      "type": "string"
+    },
+    "subject_bvn": {
+      "type": ["string", "null"]
+    },
+    "related_transaction_ids": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1
+    },
+    "total_amount_kobo": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total value of related transactions, in kobo (1/100 Naira)."
+    },
+    "currency": {
+      "type": "string",
+      "const": "NGN"
+    },
+    "narrative": {
+      "type": "string",
+      "minLength": 1
+    },
+    "date_of_activity": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "date_reported": {
+      "type": "string",
+      "format": "date-time"
+    }
+  }
+}
