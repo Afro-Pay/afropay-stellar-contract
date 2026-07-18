@@ -7,6 +7,7 @@ use crate::{
     oracle::OracleAttestation,
     errors::RemittanceError,
     events::EventEmitter,
+    migration,
 };
 
 const USDC_ISSUER: &str = "GBBD47UZQ5PBC4GHW2REORM2HJW5AU4OT4QC5TFW76ZAYDG5ZWQGURNZ"; // Testnet USDC
@@ -59,6 +60,9 @@ impl RemittanceContract {
         env.storage()
             .instance()
             .set(&Symbol::new(&env, "escrows"), &Map::<SorobanString, Escrow>::new(&env));
+
+        // Record the initial schema version so migrate() has a baseline.
+        migration::set_initial_schema_version(&env);
 
         Ok(())
     }
@@ -346,6 +350,24 @@ impl RemittanceContract {
             .set(&Symbol::new(&env, "info"), &info);
 
         Ok(())
+    }
+
+    /// Apply pending schema migrations after a WASM upgrade.
+    ///
+    /// This entry point must be called exactly once after each WASM swap that
+    /// introduces storage schema changes.  Calling it when already at the
+    /// target version is a no-op and returns `Ok(())`.
+    ///
+    /// Only the contract admin may call this function.
+    ///
+    /// # Errors
+    ///
+    /// - [`RemittanceError::NotInitialized`] if the contract has not been initialised.
+    /// - [`RemittanceError::Unauthorized`] if `admin` is not the stored admin address.
+    /// - [`RemittanceError::OperationFailed`] if a downgrade or unknown version is
+    ///   detected.
+    pub fn migrate(env: Env, admin: Address) -> Result<(), RemittanceError> {
+        migration::migrate(&env, admin)
     }
 }
 

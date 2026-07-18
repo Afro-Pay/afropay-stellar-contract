@@ -3,10 +3,12 @@ name: Escrow Contract Tests
 on:
   pull_request:
     paths:
-      - 'contracts/escrow/**'
+      - 'contracts/**'
+      - 'src/**'
   push:
     paths:
-      - 'contracts/escrow/**'
+      - 'contracts/**'
+      - 'src/**'
 
 jobs:
   test:
@@ -49,3 +51,8 @@ jobs:
         run: |
           cd contracts/escrow
           PROPTEST_CASES=100000 cargo test --features testutils -- --nocapture
+
+      - name: Run upgrade simulation tests
+        run: |
+          cd contracts/escrow
+          cargo test --features testutils upgrade -- --nocapture
