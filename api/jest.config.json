@@ -1,0 +1,12 @@
+{
+  "preset": "ts-jest",
+  "testEnvironment": "node",
+  "rootDir": ".",
+  "testMatch": ["**/__tests__/**/*.test.ts"],
+  "globals": {
+    "ts-jest": {
+      "tsconfig": "<rootDir>/tsconfig.json"
+    }
+  },
+  "clearMocks": true
+}
