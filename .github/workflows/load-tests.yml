@@ -1,0 +1,103 @@
+name: Load Tests (k6 Smoke Gate)
+
+on:
+  pull_request:
+    paths:
+      - "api/**"
+      - "load-tests/**"
+  push:
+    branches:
+      - main
+    paths:
+      - "api/**"
+      - "load-tests/**"
+
+jobs:
+  smoke:
+    name: k6 Smoke (p95 < 500ms, 0% errors @ 5 VUs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # Start the API under test
+      # ------------------------------------------------------------------
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: api/package-lock.json
+
+      - name: Install API dependencies
+        run: npm ci
+        working-directory: api
+
+      - name: Start API server
+        run: |
+          # Export minimal required env vars
+          export SEP10_SIGNING_SEED="SAPIZOWDFX4OYJNP2YYP7S3RWSGBWH5LSENWAI6PLQKULS3BKVXQ3MTQ"
+          export HOME_DOMAIN="localhost:8000"
+          export JWT_SECRET="ci-smoke-test-secret-do-not-use-in-production"
+          export STELLAR_TOML_PATH="${GITHUB_WORKSPACE}/public/.well-known/stellar.toml"
+          export PORT=8000
+          npm run dev &
+          echo "API_PID=$!" >> $GITHUB_ENV
+        working-directory: api
+
+      - name: Wait for API to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl --silent --fail http://localhost:8000/health > /dev/null; then
+              echo "API is ready after ${i}s"
+              break
+            fi
+            echo "Waiting for API... attempt ${i}/30"
+            sleep 1
+          done
+          # Final check — fail fast if still not up
+          curl --fail http://localhost:8000/health
+
+      # ------------------------------------------------------------------
+      # Install k6 and run the smoke profile
+      # ------------------------------------------------------------------
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring \
+            --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 \
+            --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] \
+            https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update -qq
+          sudo apt-get install -y k6
+
+      - name: Run k6 smoke profile
+        run: |
+          k6 run \
+            --env BASE_URL=http://localhost:8000 \
+            --env SMOKE_VUS=5 \
+            --env SMOKE_DURATION=1m \
+            --out json=load-tests/results/smoke-ci-${{ github.run_id }}.json \
+            load-tests/scenarios/smoke.js
+        # k6 exits with code 99 when thresholds fail; GH Actions treats non-zero as failure
+        # thresholds: p(95)<500ms AND error rate == 0 (defined in smoke.js)
+
+      - name: Upload smoke results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-smoke-results-${{ github.run_id }}
+          path: load-tests/results/smoke-ci-${{ github.run_id }}.json
+          retention-days: 30
+
+      - name: Tear down API server
+        if: always()
+        run: |
+          if [ -n "$API_PID" ]; then
+            kill "$API_PID" || true
+          fi
