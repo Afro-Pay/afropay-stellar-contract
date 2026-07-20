@@ -1,0 +1,3 @@
+# Ignore k6 JSON result files — they're large and CI-run-specific.
+# Only BASELINE.md and .gitkeep are committed.
+results/*.json
