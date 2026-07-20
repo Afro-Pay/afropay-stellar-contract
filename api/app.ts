@@ -5,6 +5,7 @@ import sep10Router from "./routes/sep10";
 import sep12Router from "./routes/sep12";
 import sep31Router from "./routes/sep31";
 import escrowRouter from "./routes/escrow";
+import contentRouter from "./routes/content";
 import { metricsMiddleware, metricsEndpoint } from "./middleware/metrics";
 
 import path from "path";
@@ -80,6 +81,9 @@ export function buildApp(): Express {
 
   // Escrow routes (Issue #7)
   app.use("/api/v1/escrow", escrowRouter);
+
+  // Content delivery routes
+  app.use("/api/v1/tiers", contentRouter);
 
   return app;
 }

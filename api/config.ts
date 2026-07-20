@@ -3,6 +3,7 @@ import * as path from "path";
 import TOML from "@iarna/toml";
 import { Keypair, Networks } from "@stellar/stellar-sdk";
 import * as crypto from "crypto";
+import { generateServerX25519KeyPair } from "./services/crypto";
 
 const TOML_PATH =
   process.env.STELLAR_TOML_PATH ||
@@ -25,6 +26,9 @@ export interface AnchorConfig {
   directPaymentServer: URL;
   /** The stellar.toml document as served, with any local-run overrides applied */
   tomlDocument: string;
+  masterEncryptionKey: Buffer;
+  serverX25519PublicKey: Buffer;
+  serverX25519PrivateKey: Buffer;
 }
 
 function rewriteOrigin(raw: string, homeDomain: string, scheme: string): URL {
@@ -95,6 +99,21 @@ export function loadConfig(): AnchorConfig {
       ? "https://horizon.stellar.org"
       : "https://horizon-testnet.stellar.org");
 
+  // Master encryption key
+  let masterEncryptionKey: Buffer;
+  const masterKeyBase64 = process.env.MASTER_ENCRYPTION_KEY;
+  if (masterKeyBase64) {
+    masterEncryptionKey = Buffer.from(masterKeyBase64, "base64");
+    if (masterEncryptionKey.length !== 32) {
+      throw new Error("MASTER_ENCRYPTION_KEY must be 32 bytes (base64 encoded)");
+    }
+  } else {
+    masterEncryptionKey = crypto.randomBytes(32);
+  }
+
+  // Server X25519 key pair
+  const { publicKey: serverX25519PublicKey, privateKey: serverX25519PrivateKey } = generateServerX25519KeyPair();
+
   return {
     port: parseInt(process.env.PORT || "8000", 10),
     networkPassphrase,
@@ -109,6 +128,9 @@ export function loadConfig(): AnchorConfig {
     kycServer,
     directPaymentServer,
     tomlDocument: TOML.stringify(parsed),
+    masterEncryptionKey,
+    serverX25519PublicKey,
+    serverX25519PrivateKey,
   };
 }
 
