@@ -1,0 +1,2 @@
+# k6 test run output files (JSON) are written here.
+# Individual result files are git-ignored; only BASELINE.md is committed.
