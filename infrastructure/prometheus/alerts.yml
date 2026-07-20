@@ -1,0 +1,109 @@
+---
+# AfroPay Prometheus Alert Rules
+# Loaded by Prometheus via rule_files in prometheus.yml.
+# Each alert maps 1-to-1 with a runbook in docs/operations/runbooks/.
+
+groups:
+  - name: afropay.payments
+    interval: 60s
+    rules:
+      # -----------------------------------------------------------------------
+      # ALERT: PaymentFailureRateHigh
+      # Fires when more than 5 % of payment submissions over the last 5 minutes
+      # result in a "failure" status.  This indicates a systemic problem in the
+      # payment pipeline (oracle down, Horizon unreachable, contract rejected).
+      # Runbook: docs/operations/runbooks/payment-failure-rate-high.md
+      # -----------------------------------------------------------------------
+      - alert: PaymentFailureRateHigh
+        expr: |
+          (
+            sum(rate(payment_submissions_total{status="failure"}[5m]))
+            /
+            (sum(rate(payment_submissions_total[5m])) > 0)
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          team: payments
+        annotations:
+          summary: "Payment failure rate exceeds 5 % (corridor: {{ $labels.corridor }})"
+          description: >
+            {{ $value | humanizePercentage }} of payment submissions are failing
+            over the last 5 minutes. Immediate investigation required.
+          runbook_url: "https://github.com/afropay/afropay-stellar-contract/blob/main/docs/operations/runbooks/payment-failure-rate-high.md"
+
+  - name: afropay.escrow
+    interval: 60s
+    rules:
+      # -----------------------------------------------------------------------
+      # ALERT: EscrowStuckInFunded
+      # Fires when any escrow has spent more than 30 minutes in the Funded state
+      # without transitioning to Released or Refundable.  Funds are at risk of
+      # exceeding the timeout window.
+      # Runbook: docs/operations/runbooks/escrow-stuck-in-funded.md
+      # -----------------------------------------------------------------------
+      - alert: EscrowStuckInFunded
+        expr: |
+          histogram_quantile(
+            0.99,
+            rate(escrow_state_duration_seconds_bucket{state="Funded"}[10m])
+          ) > 1800
+        for: 5m
+        labels:
+          severity: critical
+          team: payments
+        annotations:
+          summary: "P99 escrow Funded-state duration exceeds 30 minutes"
+          description: >
+            At least 1 % of escrows are spending more than 30 minutes in the
+            Funded state. This risks timeouts and lost funds if the oracle fails
+            to confirm delivery.
+          runbook_url: "https://github.com/afropay/afropay-stellar-contract/blob/main/docs/operations/runbooks/escrow-stuck-in-funded.md"
+
+  - name: afropay.oracle
+    interval: 30s
+    rules:
+      # -----------------------------------------------------------------------
+      # ALERT: RateOracleStaleness
+      # Fires when the FX rate oracle has not published a fresh rate within 120 s
+      # for any active corridor.  Stale rates lead to incorrect fee calculations
+      # and potential financial loss.
+      # Runbook: docs/operations/runbooks/rate-oracle-staleness.md
+      # -----------------------------------------------------------------------
+      - alert: RateOracleStaleness
+        expr: rate_oracle_staleness_seconds > 120
+        for: 2m
+        labels:
+          severity: warning
+          team: oracle
+        annotations:
+          summary: "FX rate oracle stale for corridor {{ $labels.corridor }}"
+          description: >
+            The rate oracle has not published a fresh rate for corridor
+            {{ $labels.corridor }} in {{ $value | humanizeDuration }}.
+            Payments on this corridor may use incorrect exchange rates.
+          runbook_url: "https://github.com/afropay/afropay-stellar-contract/blob/main/docs/operations/runbooks/rate-oracle-staleness.md"
+
+  - name: afropay.horizon
+    interval: 30s
+    rules:
+      # -----------------------------------------------------------------------
+      # ALERT: HorizonStreamLag
+      # Fires when the Horizon event listener is more than 100 ledgers behind the
+      # chain tip.  At 5 s/ledger this is ~8 minutes of lag, meaning escrow
+      # state transitions are delayed and the UI shows stale statuses.
+      # Runbook: docs/operations/runbooks/horizon-stream-lag.md
+      # -----------------------------------------------------------------------
+      - alert: HorizonStreamLag
+        expr: horizon_stream_lag_ledgers > 100
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Horizon event listener is {{ $value }} ledgers behind"
+          description: >
+            The Horizon stream listener is {{ $value }} ledgers behind the chain
+            tip (threshold: 100). Escrow state transitions will be delayed and
+            the oracle may miss delivery confirmations.
+          runbook_url: "https://github.com/afropay/afropay-stellar-contract/blob/main/docs/operations/runbooks/horizon-stream-lag.md"
