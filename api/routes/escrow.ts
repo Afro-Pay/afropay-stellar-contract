@@ -1,20 +1,22 @@
 /**
  * Escrow management routes.
  *
- * POST /api/v1/escrow              – create an escrow (payment initiation)
- * GET  /api/v1/escrow/:id          – get escrow state
- * POST /api/v1/escrow/:id/release  – release funds to agent  (SEP-10 Ed25519 required)
- * POST /api/v1/escrow/:id/dispute  – open a dispute          (SEP-10 Ed25519 required)
+ * POST /api/v1/escrow            – create an escrow (payment initiation)
+ * GET  /api/v1/escrow/:id        – get escrow state
+ * POST /api/v1/escrow/:id/release  – release funds to agent (SEP-10 required)
+ * POST /api/v1/escrow/:id/dispute  – open a dispute  (SEP-10 required)
  *
- * The /release and /dispute endpoints are gated by requireSep10Ed25519 which:
- *  - Fetches the anchor's public key from stellar.toml (cached 1 h)
- *  - Verifies the JWT's EdDSA signature against that key
- *  - Returns 401 with a descriptive error for all failure scenarios
+ * Sensitive endpoints (/release, /dispute) are gated by the full SEP-10
+ * Ed25519 JWT verification middleware (not just the shared-secret variant).
  */
 
 import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { requireSep10Ed25519 } from "../middleware/sep10";
+import {
+  paymentSubmissionsTotal,
+  escrowStateDurationSeconds,
+} from "../services/metrics";
 
 export type EscrowState = "Funded" | "Released" | "Refundable" | "Refunded" | "Cancelled";
 
@@ -70,6 +72,8 @@ router.post("/", (req: Request, res: Response): void => {
   };
   escrows.set(id, record);
 
+  paymentSubmissionsTotal.inc({ status: "pending", corridor: record.corridor });
+
   res.status(201).json({ escrow_id: id, state: record.state });
 });
 
@@ -91,7 +95,7 @@ router.get("/:id", (req: Request, res: Response): void => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /api/v1/escrow/:id/release — SEP-10 Ed25519 gated
+// POST /api/v1/escrow/:id/release — SEP-10 gated
 // ---------------------------------------------------------------------------
 router.post("/:id/release", requireSep10Ed25519, (req: Request, res: Response): void => {
   const record = escrows.get(req.params.id);
@@ -102,14 +106,20 @@ router.post("/:id/release", requireSep10Ed25519, (req: Request, res: Response): 
     return;
   }
 
+  // Record time spent in Funded state
+  const durationSec = (Date.now() - record.stateChangedAt.getTime()) / 1000;
+  escrowStateDurationSeconds.observe({ state: "Funded" }, durationSec);
+
   record.state = "Released";
   record.stateChangedAt = new Date();
+
+  paymentSubmissionsTotal.inc({ status: "success", corridor: record.corridor });
 
   res.json({ escrow_id: record.id, state: record.state });
 });
 
 // ---------------------------------------------------------------------------
-// POST /api/v1/escrow/:id/dispute — SEP-10 Ed25519 gated
+// POST /api/v1/escrow/:id/dispute — SEP-10 gated
 // ---------------------------------------------------------------------------
 router.post("/:id/dispute", requireSep10Ed25519, (req: Request, res: Response): void => {
   const record = escrows.get(req.params.id);
@@ -120,8 +130,13 @@ router.post("/:id/dispute", requireSep10Ed25519, (req: Request, res: Response): 
     return;
   }
 
+  const durationSec = (Date.now() - record.stateChangedAt.getTime()) / 1000;
+  escrowStateDurationSeconds.observe({ state: record.state }, durationSec);
+
   record.state = "Refundable";
   record.stateChangedAt = new Date();
+
+  paymentSubmissionsTotal.inc({ status: "failure", corridor: record.corridor });
 
   res.json({ escrow_id: record.id, state: record.state });
 });

@@ -1,14 +1,12 @@
 {
   "preset": "ts-jest",
   "testEnvironment": "node",
-  "roots": ["<rootDir>/__tests__"],
+  "rootDir": ".",
   "testMatch": ["**/__tests__/**/*.test.ts"],
-  "setupFiles": ["<rootDir>/jest.setup.ts"],
   "globals": {
     "ts-jest": {
       "tsconfig": "<rootDir>/tsconfig.json"
     }
   },
-  "forceExit": true,
-  "detectOpenHandles": true
+  "clearMocks": true
 }
