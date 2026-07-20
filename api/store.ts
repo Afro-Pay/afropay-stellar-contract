@@ -75,3 +75,91 @@ export function findCustomer(query: {
   }
   return undefined;
 }
+
+// ============================================================================
+// Encrypted Content Delivery Interfaces & Stores
+// ============================================================================
+
+export interface Tier {
+  id: string;
+  creatorAccount: string; // Stellar account of the tier creator
+  name: string;
+  createdAt: string;
+}
+
+export interface TierContentKey {
+  id: string;
+  tierId: string;
+  encryptedKey: string; // Encrypted with server master key
+  keyVersion: number;
+  rotatedAt: string | null;
+  createdAt: string;
+}
+
+export interface CreatorContent {
+  id: string;
+  tierId: string;
+  keyVersion: number;
+  encryptedContentUrl: string;
+  iv: string;
+  authTag: string;
+  createdAt: string;
+}
+
+export interface Pass {
+  id: string;
+  fanAccount: string;
+  tierId: string;
+  active: boolean;
+  createdAt: string;
+}
+
+export const tiers = new Map<string, Tier>();
+export const tierContentKeys = new Map<string, TierContentKey>();
+export const creatorContents = new Map<string, CreatorContent>();
+export const passes = new Map<string, Pass>();
+
+export function findTierById(id: string): Tier | undefined {
+  return tiers.get(id);
+}
+
+export function findTierContentKeyByTierId(tierId: string): TierContentKey | undefined {
+  let latestKey: TierContentKey | undefined;
+  for (const key of tierContentKeys.values()) {
+    if (key.tierId === tierId) {
+      if (!latestKey || key.keyVersion > latestKey.keyVersion) {
+        latestKey = key;
+      }
+    }
+  }
+  return latestKey;
+}
+
+export function findAllTierContentKeysByTierId(tierId: string): TierContentKey[] {
+  const keys: TierContentKey[] = [];
+  for (const key of tierContentKeys.values()) {
+    if (key.tierId === tierId) {
+      keys.push(key);
+    }
+  }
+  return keys;
+}
+
+export function findCreatorContentsByTierId(tierId: string): CreatorContent[] {
+  const contents: CreatorContent[] = [];
+  for (const content of creatorContents.values()) {
+    if (content.tierId === tierId) {
+      contents.push(content);
+    }
+  }
+  return contents;
+}
+
+export function findActivePass(fanAccount: string, tierId: string): Pass | undefined {
+  for (const pass of passes.values()) {
+    if (pass.fanAccount === fanAccount && pass.tierId === tierId && pass.active) {
+      return pass;
+    }
+  }
+  return undefined;
+}

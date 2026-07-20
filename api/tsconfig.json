@@ -19,6 +19,10 @@
     "routes/**/*.ts",
     "middleware/**/*.ts",
     "webhooks/**/*.ts",
+    "services/**/*.ts",
     "__tests__/**/*.ts"
+  ],
+  "exclude": [
+    "../services/**"
   ]
 }
