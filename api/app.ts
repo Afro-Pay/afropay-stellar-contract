@@ -3,6 +3,7 @@ import { config } from "./config";
 import sep10Router from "./routes/sep10";
 import sep12Router from "./routes/sep12";
 import sep31Router from "./routes/sep31";
+import escrowRouter from "./routes/escrow";
 
 function mountPath(url: URL): string {
   return url.pathname.replace(/\/$/, "") || "/";
@@ -33,6 +34,9 @@ export function buildApp(): Express {
   app.use(mountPath(config.webAuthEndpoint), sep10Router);
   app.use(mountPath(config.kycServer), sep12Router);
   app.use(mountPath(config.directPaymentServer), sep31Router);
+
+  // Escrow routes — release and dispute are gated by SEP-10 Ed25519 middleware
+  app.use("/api/v1/escrow", escrowRouter);
 
   return app;
 }
