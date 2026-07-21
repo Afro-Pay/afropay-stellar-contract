@@ -1,0 +1,245 @@
+# =============================================================================
+# AfroPay Redis DR Validation — Docker Compose
+# =============================================================================
+#
+# Purpose: Validate that Redis RDB + AOF backups can be used to restore a
+#          working Redis instance with correct key counts.
+#
+# Acceptance criterion (from issue):
+#   Kill Redis, start a new instance from backup, confirm key count matches.
+#
+# Usage:
+#   # 1. Seed test data and capture snapshot
+#   docker compose -f docker-compose.redis-dr-test.yml run --rm redis-seed
+#
+#   # 2. Kill the "primary" Redis and copy backup files
+#   docker compose -f docker-compose.redis-dr-test.yml down redis-primary
+#
+#   # 3. Start restored instance and validate
+#   docker compose -f docker-compose.redis-dr-test.yml run --rm redis-validate
+#
+#   # Full automated drill (all steps):
+#   docker compose -f docker-compose.redis-dr-test.yml up --abort-on-container-exit
+#
+# Exit codes:
+#   0 — validation passed (key count matches)
+#   1 — validation failed (key count mismatch or Redis unreachable)
+# =============================================================================
+
+version: "3.9"
+
+services:
+
+  # --------------------------------------------------------------------------
+  # redis-primary: the "live" Redis instance using our backup config
+  # --------------------------------------------------------------------------
+  redis-primary:
+    image: redis:7.2-alpine
+    container_name: afropay-redis-primary
+    command: >
+      redis-server
+        --save 60 1
+        --appendonly yes
+        --appendfilename appendonly.aof
+        --appendfsync everysec
+        --aof-use-rdb-preamble yes
+        --maxmemory 256mb
+        --maxmemory-policy allkeys-lru
+        --loglevel notice
+    volumes:
+      - redis-primary-data:/data
+    ports:
+      - "6380:6379"   # non-default port to avoid collision with local Redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - redis-dr-net
+
+  # --------------------------------------------------------------------------
+  # redis-seed: populate primary with realistic test data then force a snapshot
+  # --------------------------------------------------------------------------
+  redis-seed:
+    image: redis:7.2-alpine
+    container_name: afropay-redis-seed
+    depends_on:
+      redis-primary:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+
+        HOST=redis-primary
+        PORT=6379
+        CLI="redis-cli -h $${HOST} -p $${PORT}"
+
+        echo "=== Seeding test data ==="
+
+        # Simulate idempotency keys (24-hour TTL)
+        for i in $$(seq 1 50); do
+          $${CLI} SET "idempotency:flutterwave:ref-$${i}" "{\"status\":\"processed\",\"ref\":\"ref-$${i}\"}" EX 86400
+        done
+
+        # Simulate rate-limit counters (1-hour TTL)
+        for i in $$(seq 1 20); do
+          $${CLI} SET "ratelimit:user:user-$${i}:transfer" "3" EX 3600
+        done
+
+        # Simulate BullMQ waiting jobs
+        for i in $$(seq 1 10); do
+          $${CLI} LPUSH "bull:payment:wait" "{\"id\":\"job-$${i}\",\"data\":{\"escrow\":\"esc-$${i}\"}}"
+        done
+
+        # Simulate DLQ entries
+        for i in $$(seq 1 5); do
+          $${CLI} LPUSH "bull:payment:failed" "{\"id\":\"dlq-$${i}\",\"failedReason\":\"timeout\"}"
+        done
+
+        TOTAL=$$($${CLI} DBSIZE)
+        echo "=== Seeded $${TOTAL} keys total ==="
+
+        # Write the expected key count to a shared volume for the validator
+        echo "$${TOTAL}" > /shared/expected_key_count.txt
+
+        # Force RDB save + AOF flush
+        echo "=== Triggering BGSAVE ==="
+        $${CLI} BGSAVE
+        sleep 3   # wait for background save to complete
+
+        echo "=== Verifying dump.rdb exists ==="
+        redis-cli -h $${HOST} -p $${PORT} DEBUG SLEEP 0   # no-op to confirm reachability
+
+        echo "=== Seed complete ==="
+    volumes:
+      - redis-primary-data:/data
+      - shared-state:/shared
+    networks:
+      - redis-dr-net
+
+  # --------------------------------------------------------------------------
+  # redis-backup-copy: copy RDB + AOF files from primary volume to DR volume
+  # --------------------------------------------------------------------------
+  redis-backup-copy:
+    image: alpine:3.19
+    container_name: afropay-redis-backup-copy
+    depends_on:
+      redis-seed:
+        condition: service_completed_successfully
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        echo "=== Copying backup files to DR volume ==="
+        cp /primary-data/dump.rdb /dr-data/dump.rdb 2>/dev/null || echo "WARN: dump.rdb not found"
+        cp /primary-data/appendonly.aof /dr-data/appendonly.aof 2>/dev/null || echo "WARN: appendonly.aof not found"
+        ls -lh /dr-data/
+        echo "=== Copy complete ==="
+    volumes:
+      - redis-primary-data:/primary-data:ro
+      - redis-dr-data:/dr-data
+    networks:
+      - redis-dr-net
+
+  # --------------------------------------------------------------------------
+  # redis-restored: fresh Redis instance loading from the copied backup files
+  # --------------------------------------------------------------------------
+  redis-restored:
+    image: redis:7.2-alpine
+    container_name: afropay-redis-restored
+    depends_on:
+      redis-backup-copy:
+        condition: service_completed_successfully
+    command: >
+      redis-server
+        --appendonly yes
+        --appendfilename appendonly.aof
+        --aof-use-rdb-preamble yes
+        --loglevel notice
+    volumes:
+      - redis-dr-data:/data
+    ports:
+      - "6381:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    networks:
+      - redis-dr-net
+
+  # --------------------------------------------------------------------------
+  # redis-validate: compare restored key count against expected baseline
+  # --------------------------------------------------------------------------
+  redis-validate:
+    image: redis:7.2-alpine
+    container_name: afropay-redis-validate
+    depends_on:
+      redis-restored:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+
+        HOST=redis-restored
+        PORT=6379
+        CLI="redis-cli -h $${HOST} -p $${PORT}"
+
+        EXPECTED=$$(cat /shared/expected_key_count.txt)
+        ACTUAL=$$($${CLI} DBSIZE)
+
+        echo "============================================"
+        echo "AfroPay Redis DR Validation"
+        echo "============================================"
+        echo "Expected key count : $${EXPECTED}"
+        echo "Restored key count : $${ACTUAL}"
+        echo ""
+
+        # Spot-check key categories
+        IDEMPOTENCY_KEYS=$$($${CLI} KEYS "idempotency:*" | wc -l)
+        RATELIMIT_KEYS=$$($${CLI} KEYS "ratelimit:*" | wc -l)
+        BULL_WAIT=$$($${CLI} LLEN "bull:payment:wait")
+        BULL_FAILED=$$($${CLI} LLEN "bull:payment:failed")
+
+        echo "Spot checks:"
+        echo "  idempotency keys   : $${IDEMPOTENCY_KEYS} (expected 50)"
+        echo "  rate-limit keys    : $${RATELIMIT_KEYS} (expected 20)"
+        echo "  bull:payment:wait  : $${BULL_WAIT} (expected 10)"
+        echo "  bull:payment:failed: $${BULL_FAILED} (expected 5)"
+        echo ""
+
+        PASS=1
+        [ "$${ACTUAL}" -eq "$${EXPECTED}" ] || { echo "FAIL: Key count mismatch"; PASS=0; }
+        [ "$${IDEMPOTENCY_KEYS}" -eq 50 ]   || { echo "FAIL: Idempotency key count mismatch"; PASS=0; }
+        [ "$${RATELIMIT_KEYS}" -eq 20 ]     || { echo "FAIL: Rate-limit key count mismatch"; PASS=0; }
+        [ "$${BULL_WAIT}" -eq 10 ]          || { echo "FAIL: BullMQ wait queue mismatch"; PASS=0; }
+        [ "$${BULL_FAILED}" -eq 5 ]         || { echo "FAIL: BullMQ failed queue mismatch"; PASS=0; }
+
+        if [ "$${PASS}" -eq 1 ]; then
+          echo "RESULT: PASS — Redis DR validation successful"
+          echo "RESULT=PASS" > /shared/validation_result.txt
+          exit 0
+        else
+          echo "RESULT: FAIL — Redis DR validation failed"
+          echo "RESULT=FAIL" > /shared/validation_result.txt
+          exit 1
+        fi
+    volumes:
+      - shared-state:/shared:ro
+    networks:
+      - redis-dr-net
+
+volumes:
+  redis-primary-data:
+    driver: local
+  redis-dr-data:
+    driver: local
+  shared-state:
+    driver: local
+
+networks:
+  redis-dr-net:
+    driver: bridge

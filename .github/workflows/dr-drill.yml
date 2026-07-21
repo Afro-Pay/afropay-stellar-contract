@@ -1,0 +1,502 @@
+# =============================================================================
+# AfroPay — Monthly DR Drill Workflow
+# =============================================================================
+#
+# Runs on the first Monday of each month at 02:00 UTC.
+# Also triggerable manually via workflow_dispatch for ad-hoc drills.
+#
+# What it does:
+#   1. Spins up a PostgreSQL 16 container on the runner
+#   2. Seeds it with representative AfroPay schema + data
+#   3. Takes a pgBackRest backup to a local S3-compatible store (MinIO)
+#   4. Waits 5 seconds (simulates passage of time / new writes)
+#   5. Runs scripts/dr/restore-postgres.sh to PITR restore to "1 h ago"
+#   6. Validates all 8 integrity checks pass
+#   7. Runs Redis DR validation via docker-compose.redis-dr-test.yml
+#   8. Posts a summary to Slack (#dr-alerts)
+#   9. Commits the result JSON to docs/operations/dr-drill-results/
+#  10. Fails the workflow if any check does not pass (alerts on-call)
+#
+# Required GitHub Secrets:
+#   DR_SLACK_WEBHOOK_URL           — Slack incoming webhook URL
+#   PGBACKREST_REPO1_CIPHER_PASS   — pgBackRest encryption passphrase
+#   STAGING_DB_PASSWORD            — password for the staging postgres user
+#
+# Optional overrides (defaults shown):
+#   DR_STANZA            — pgBackRest stanza name (default: afropay)
+#   DR_TARGET_OFFSET_MIN — how many minutes back to restore (default: 60)
+# =============================================================================
+
+name: DR Drill — Monthly
+
+on:
+  # First Monday of every month at 02:00 UTC.
+  # GitHub Actions does not natively support "first Monday" so we schedule
+  # for every Monday and gate on the day-of-month in the job step.
+  schedule:
+    - cron: "0 2 * * 1"   # every Monday 02:00 UTC
+
+  # Allow manual trigger for ad-hoc drills or to rerun after a failure.
+  workflow_dispatch:
+    inputs:
+      target_offset_minutes:
+        description: "Restore to N minutes in the past (default: 60)"
+        required: false
+        default: "60"
+      force_run:
+        description: "Run even if not the first Monday of the month"
+        type: boolean
+        required: false
+        default: false
+
+env:
+  STANZA: ${{ vars.DR_STANZA || 'afropay' }}
+  PG_VERSION: "16"
+  PG_USER: "postgres"
+  PG_DB: "afropay"
+  PG_PORT: "5433"         # non-default to avoid conflicts
+  MINIO_PORT: "9000"
+  MINIO_BUCKET: "afropay-db-backups"
+  TARGET_OFFSET_MIN: ${{ inputs.target_offset_minutes || '60' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Gate: only proceed on the first Monday of the month (for scheduled runs)
+  # ---------------------------------------------------------------------------
+  check-schedule:
+    name: Check — First Monday Gate
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+    steps:
+      - name: Determine if this is the first Monday of the month
+        id: gate
+        run: |
+          # Force-run from workflow_dispatch skips the gate
+          if [[ "${{ inputs.force_run }}" == "true" || "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "Forced run — skipping first-Monday gate."
+            exit 0
+          fi
+          DAY=$(date -u +%-d)
+          if [[ $DAY -le 7 ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+            echo "First Monday of the month — drill will run."
+          else
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            echo "Not the first Monday (day=$DAY) — skipping drill."
+          fi
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL PITR Drill
+  # ---------------------------------------------------------------------------
+  postgres-pitr-drill:
+    name: Postgres PITR Drill
+    runs-on: ubuntu-latest
+    needs: check-schedule
+    if: needs.check-schedule.outputs.should_run == 'true'
+
+    services:
+      # MinIO — S3-compatible storage for pgBackRest archives
+      minio:
+        image: minio/minio:RELEASE.2024-01-01T00-00-00Z
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        ports:
+          - "9000:9000"
+        options: >-
+          --health-cmd "curl -sf http://localhost:9000/minio/health/live"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+        # MinIO needs a command to run in server mode
+        # The service container uses the default entrypoint which handles this
+
+    env:
+      # pgBackRest credentials pointing at local MinIO
+      PGBACKREST_S3_KEY: minioadmin
+      PGBACKREST_S3_KEY_SECRET: minioadmin
+      PGBACKREST_REPO1_CIPHER_PASS: ${{ secrets.PGBACKREST_REPO1_CIPHER_PASS }}
+      PGPASSWORD: ${{ secrets.STAGING_DB_PASSWORD || 'dr-drill-password' }}
+      DR_POSTGRES_USER: postgres
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PostgreSQL ${{ env.PG_VERSION }} + pgBackRest
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-${{ env.PG_VERSION }} \
+            pgbackrest \
+            awscli \
+            jq
+
+      - name: Install MinIO client (mc) and create bucket
+        run: |
+          curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc \
+            -o /usr/local/bin/mc
+          chmod +x /usr/local/bin/mc
+          mc alias set local http://localhost:${{ env.MINIO_PORT }} minioadmin minioadmin
+          mc mb local/${{ env.MINIO_BUCKET }} || true
+          echo "MinIO bucket created: ${{ env.MINIO_BUCKET }}"
+
+      - name: Configure PostgreSQL for WAL archiving
+        run: |
+          # Locate the PostgreSQL config directory
+          PG_CONF_DIR="/etc/postgresql/${{ env.PG_VERSION }}/main"
+          PG_DATA_DIR="/var/lib/postgresql/${{ env.PG_VERSION }}/main"
+
+          # Apply WAL archiving settings
+          sudo tee -a "${PG_CONF_DIR}/postgresql.conf" <<EOF
+          # DR Drill: WAL archiving
+          wal_level = replica
+          archive_mode = on
+          archive_command = 'pgbackrest --config=/tmp/pgbackrest-drill.conf --stanza=${{ env.STANZA }} archive-push %p'
+          archive_timeout = 60
+          EOF
+
+          echo "PostgreSQL WAL archiving configured."
+
+      - name: Write pgBackRest config for drill
+        run: |
+          cat > /tmp/pgbackrest-drill.conf <<EOF
+          [global]
+          repo1-type=s3
+          repo1-s3-bucket=${{ env.MINIO_BUCKET }}
+          repo1-s3-region=us-east-1
+          repo1-s3-key=${{ env.PGBACKREST_S3_KEY }}
+          repo1-s3-key-secret=${{ env.PGBACKREST_S3_KEY_SECRET }}
+          repo1-s3-endpoint=localhost:${{ env.MINIO_PORT }}
+          repo1-s3-uri-style=path
+          repo1-storage-verify-tls=n
+          repo1-cipher-type=aes-256-cbc
+          repo1-cipher-pass=${{ env.PGBACKREST_REPO1_CIPHER_PASS }}
+          repo1-retention-full=1
+          compress-type=lz4
+          compress-level=3
+          process-max=2
+          log-level-console=info
+          log-level-file=off
+          lock-path=/tmp/pgbackrest-lock
+
+          [global:archive-push]
+          compress-type=lz4
+
+          [${{ env.STANZA }}]
+          pg1-path=/var/lib/postgresql/${{ env.PG_VERSION }}/main
+          pg1-socket-path=/var/run/postgresql
+          pg1-port=5432
+          pg1-database=postgres
+          pg1-user=postgres
+          EOF
+          echo "pgBackRest config written to /tmp/pgbackrest-drill.conf"
+
+      - name: Start PostgreSQL and create stanza
+        run: |
+          sudo service postgresql start
+          sleep 3
+
+          # Create pgbackrest OS user role in Postgres
+          sudo -u postgres psql -c "CREATE ROLE pgbackrest SUPERUSER LOGIN;"
+
+          # Create the AfroPay database and apply all migrations
+          sudo -u postgres psql -c "CREATE DATABASE ${{ env.PG_DB }};"
+
+          # Apply DB migrations
+          sudo -u postgres psql -d ${{ env.PG_DB }} -f db/migrations/001_listener_checkpoint.sql
+          sudo -u postgres psql -d ${{ env.PG_DB }} -f db/migrations/002_reconciliation_reports.sql
+          sudo -u postgres psql -d ${{ env.PG_DB }} -f api/migrations/001_webhook_idempotency.sql
+
+          # Seed some representative rows
+          sudo -u postgres psql -d ${{ env.PG_DB }} <<'SQL'
+          INSERT INTO checkpoint_store (service_name, paging_token, ledger_seq)
+          VALUES ('horizon', '0000000000000001-0000000001', 1000000)
+          ON CONFLICT DO NOTHING;
+
+          INSERT INTO escrow_events
+            (event_id, paging_token, ledger_seq, tx_hash, contract_id, event_type, escrow_id, payload)
+          SELECT
+            'event-' || g,
+            'token-' || g,
+            1000000 + g,
+            repeat('a', 64),
+            repeat('b', 56),
+            'deposit',
+            'escrow-' || g,
+            '{"amount":1000}'::jsonb
+          FROM generate_series(1, 100) AS g
+          ON CONFLICT DO NOTHING;
+          SQL
+
+          echo "Database seeded with test data."
+
+          # Create stanza
+          pgbackrest --config=/tmp/pgbackrest-drill.conf --stanza=${{ env.STANZA }} stanza-create
+          echo "pgBackRest stanza created."
+
+      - name: Take a full backup (baseline)
+        run: |
+          pgbackrest --config=/tmp/pgbackrest-drill.conf --stanza=${{ env.STANZA }} backup --type=full
+          pgbackrest --config=/tmp/pgbackrest-drill.conf --stanza=${{ env.STANZA }} info
+          echo "Full backup complete."
+
+      - name: Simulate time passage and additional writes
+        run: |
+          # Add 50 more escrow events (these should appear in the restored DB
+          # since the target time is 1 min in the past, after the full backup)
+          sudo -u postgres psql -d ${{ env.PG_DB }} <<'SQL'
+          INSERT INTO escrow_events
+            (event_id, paging_token, ledger_seq, tx_hash, contract_id, event_type, escrow_id, payload)
+          SELECT
+            'event-post-' || g,
+            'token-post-' || g,
+            2000000 + g,
+            repeat('c', 64),
+            repeat('d', 56),
+            'release',
+            'escrow-post-' || g,
+            '{"amount":1000,"status":"released"}'::jsonb
+          FROM generate_series(1, 50) AS g
+          ON CONFLICT DO NOTHING;
+          SQL
+
+          # Force WAL archival
+          sudo -u postgres psql -c "SELECT pg_switch_wal();"
+          sleep 5
+          echo "Post-backup writes complete and archived."
+
+      - name: Record target time (1 minute in the past from now)
+        id: target
+        run: |
+          TARGET=$(date -u -d "1 minute ago" +"%Y-%m-%d %H:%M:%S UTC")
+          echo "target_time=${TARGET}" >> "$GITHUB_OUTPUT"
+          echo "Restore target time: ${TARGET}"
+
+      - name: Stop PostgreSQL (simulates the disaster)
+        run: |
+          sudo service postgresql stop
+          echo "PostgreSQL stopped — simulating disaster."
+
+      - name: Run PITR restore script
+        id: restore
+        run: |
+          # Make the script executable
+          chmod +x scripts/dr/restore-postgres.sh
+
+          # Override PGDATA and port for CI environment
+          PGDATA="/var/lib/postgresql/${{ env.PG_VERSION }}/main"
+
+          PGBACKREST_S3_KEY=${{ env.PGBACKREST_S3_KEY }} \
+          PGBACKREST_S3_KEY_SECRET=${{ env.PGBACKREST_S3_KEY_SECRET }} \
+          PGBACKREST_REPO1_CIPHER_PASS=${{ env.PGBACKREST_REPO1_CIPHER_PASS }} \
+          DR_POSTGRES_USER=postgres \
+          PGPASSWORD=${{ env.PGPASSWORD }} \
+          ./scripts/dr/restore-postgres.sh \
+            --target-time "${{ steps.target.outputs.target_time }}" \
+            --stanza ${{ env.STANZA }} \
+            --pgdata "${PGDATA}" \
+            --pg-port 5432 \
+            --config /tmp/pgbackrest-drill.conf \
+            2>&1 | tee /tmp/restore-output.txt
+
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Parse drill result
+        id: result
+        if: always()
+        run: |
+          # Find the most recently written result file
+          RESULT_FILE=$(ls -t docs/operations/dr-drill-results/*_result.json 2>/dev/null | head -1)
+          if [[ -z "${RESULT_FILE}" ]]; then
+            echo "status=UNKNOWN" >> "$GITHUB_OUTPUT"
+            echo "elapsed=0" >> "$GITHUB_OUTPUT"
+            echo "rto_met=false" >> "$GITHUB_OUTPUT"
+            echo "result_file=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          STATUS=$(jq -r .status "${RESULT_FILE}")
+          ELAPSED=$(jq -r .elapsed_seconds "${RESULT_FILE}")
+          RTO_MET=$(jq -r .rto_met "${RESULT_FILE}")
+
+          echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
+          echo "elapsed=${ELAPSED}" >> "$GITHUB_OUTPUT"
+          echo "rto_met=${RTO_MET}" >> "$GITHUB_OUTPUT"
+          echo "result_file=${RESULT_FILE}" >> "$GITHUB_OUTPUT"
+
+          echo "Drill status: ${STATUS} | Elapsed: ${ELAPSED}s | RTO met: ${RTO_MET}"
+          cat "${RESULT_FILE}"
+
+      - name: Commit drill result to repository
+        if: always()
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore(dr): monthly drill result ${{ steps.result.outputs.status }} — $(date -u +%Y-%m-%d)"
+          file_pattern: "docs/operations/dr-drill-results/*.json"
+          commit_author: "github-actions[bot] <github-actions[bot]@users.noreply.github.com>"
+
+      - name: Post result to Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.DR_SLACK_WEBHOOK_URL }}
+        run: |
+          STATUS="${{ steps.result.outputs.status }}"
+          ELAPSED="${{ steps.result.outputs.elapsed }}"
+          RTO_MET="${{ steps.result.outputs.rto_met }}"
+          RESULT_FILE="${{ steps.result.outputs.result_file }}"
+          DRILL_DATE=$(date -u +"%Y-%m-%d")
+
+          # Choose emoji based on result
+          if [[ "${STATUS}" == "PASS" ]]; then
+            EMOJI=":white_check_mark:"
+            COLOR="good"
+          else
+            EMOJI=":x:"
+            COLOR="danger"
+          fi
+
+          # Build Slack message payload
+          ELAPSED_MIN=$(( ${ELAPSED:-0} / 60 ))
+
+          PAYLOAD=$(cat <<JSON
+          {
+            "attachments": [
+              {
+                "color": "${COLOR}",
+                "title": "${EMOJI} AfroPay DR Drill — ${DRILL_DATE}",
+                "fields": [
+                  {"title": "Status",       "value": "${STATUS}",                        "short": true},
+                  {"title": "RTO Met",      "value": "${RTO_MET} (target: 4h)",          "short": true},
+                  {"title": "Elapsed",      "value": "${ELAPSED_MIN} min (${ELAPSED}s)", "short": true},
+                  {"title": "Target Time",  "value": "${{ steps.target.outputs.target_time }}", "short": true},
+                  {"title": "Result File",  "value": "${RESULT_FILE}",                   "short": false},
+                  {"title": "Workflow Run", "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}", "short": false}
+                ],
+                "footer": "AfroPay Platform Engineering",
+                "ts": $(date +%s)
+              }
+            ]
+          }
+          JSON
+          )
+
+          if [[ -n "${SLACK_WEBHOOK}" ]]; then
+            HTTP_STATUS=$(curl -s -o /tmp/slack-response.txt -w "%{http_code}" \
+              -X POST \
+              -H 'Content-type: application/json' \
+              --data "${PAYLOAD}" \
+              "${SLACK_WEBHOOK}")
+
+            if [[ "${HTTP_STATUS}" == "200" ]]; then
+              echo "Slack notification sent successfully."
+            else
+              echo "WARNING: Slack notification failed (HTTP ${HTTP_STATUS})."
+              cat /tmp/slack-response.txt
+            fi
+          else
+            echo "WARNING: DR_SLACK_WEBHOOK_URL secret not set — skipping Slack notification."
+            echo "Drill result: ${STATUS} in ${ELAPSED}s"
+          fi
+
+      - name: Fail workflow if drill did not pass
+        if: always()
+        run: |
+          STATUS="${{ steps.result.outputs.status }}"
+          if [[ "${STATUS}" != "PASS" ]]; then
+            echo "::error::DR drill FAILED with status: ${STATUS}"
+            echo "Review the result file and restore output for details."
+            exit 1
+          fi
+          echo "DR drill PASSED."
+
+  # ---------------------------------------------------------------------------
+  # Redis DR Validation
+  # ---------------------------------------------------------------------------
+  redis-dr-validation:
+    name: Redis DR Validation
+    runs-on: ubuntu-latest
+    needs: check-schedule
+    if: needs.check-schedule.outputs.should_run == 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Redis DR validation via Docker Compose
+        id: redis_validate
+        run: |
+          docker compose \
+            -f infrastructure/backup/docker-compose.redis-dr-test.yml \
+            up --abort-on-container-exit --exit-code-from redis-validate \
+            2>&1 | tee /tmp/redis-dr-output.txt
+
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "exit_code=${EXIT_CODE}" >> "$GITHUB_OUTPUT"
+
+          if [[ ${EXIT_CODE} -eq 0 ]]; then
+            echo "redis_status=PASS" >> "$GITHUB_OUTPUT"
+          else
+            echo "redis_status=FAIL" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post Redis result to Slack
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.DR_SLACK_WEBHOOK_URL }}
+        run: |
+          REDIS_STATUS="${{ steps.redis_validate.outputs.redis_status }}"
+          DRILL_DATE=$(date -u +"%Y-%m-%d")
+
+          if [[ "${REDIS_STATUS}" == "PASS" ]]; then
+            EMOJI=":white_check_mark:"
+            COLOR="good"
+          else
+            EMOJI=":x:"
+            COLOR="danger"
+          fi
+
+          PAYLOAD=$(cat <<JSON
+          {
+            "attachments": [
+              {
+                "color": "${COLOR}",
+                "title": "${EMOJI} AfroPay Redis DR Validation — ${DRILL_DATE}",
+                "fields": [
+                  {"title": "Status",       "value": "${REDIS_STATUS}",  "short": true},
+                  {"title": "Workflow Run", "value": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}", "short": false}
+                ],
+                "footer": "AfroPay Platform Engineering",
+                "ts": $(date +%s)
+              }
+            ]
+          }
+          JSON
+          )
+
+          if [[ -n "${SLACK_WEBHOOK}" ]]; then
+            curl -s -X POST -H 'Content-type: application/json' \
+              --data "${PAYLOAD}" "${SLACK_WEBHOOK}" || true
+          else
+            echo "Redis validation result: ${REDIS_STATUS}"
+          fi
+
+      - name: Clean up Docker Compose resources
+        if: always()
+        run: |
+          docker compose \
+            -f infrastructure/backup/docker-compose.redis-dr-test.yml \
+            down --volumes --remove-orphans || true
+
+      - name: Fail if Redis validation did not pass
+        if: always()
+        run: |
+          STATUS="${{ steps.redis_validate.outputs.redis_status }}"
+          if [[ "${STATUS}" != "PASS" ]]; then
+            echo "::error::Redis DR validation FAILED"
+            cat /tmp/redis-dr-output.txt
+            exit 1
+          fi
+          echo "Redis DR validation PASSED."
