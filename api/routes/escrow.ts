@@ -3,6 +3,7 @@
  *
  * POST /api/v1/escrow            – create an escrow (payment initiation)
  * GET  /api/v1/escrow/:id        – get escrow state
+ * GET  /api/v1/escrow/:id/stream – real-time escrow timeline via SSE (Issue #24)
  * POST /api/v1/escrow/:id/release  – release funds to agent (SEP-10 required)
  * POST /api/v1/escrow/:id/dispute  – open a dispute  (SEP-10 required)
  *
@@ -17,6 +18,10 @@ import {
   paymentSubmissionsTotal,
   escrowStateDurationSeconds,
 } from "../services/metrics";
+import { escrowEventStore, EscrowEvent } from "../services/eventStore";
+
+/** How often to write an SSE comment so idle proxies don't time out the connection. */
+const SSE_HEARTBEAT_INTERVAL_MS = 15_000;
 
 export type EscrowState = "Funded" | "Released" | "Refundable" | "Refunded" | "Cancelled";
 
@@ -72,6 +77,13 @@ router.post("/", (req: Request, res: Response): void => {
   };
   escrows.set(id, record);
 
+  escrowEventStore.append(id, {
+    type: "created",
+    state: record.state,
+    corridor: record.corridor,
+    amountUsdc: record.amountUsdc,
+  });
+
   paymentSubmissionsTotal.inc({ status: "pending", corridor: record.corridor });
 
   res.status(201).json({ escrow_id: id, state: record.state });
@@ -95,6 +107,66 @@ router.get("/:id", (req: Request, res: Response): void => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /api/v1/escrow/:id/stream — real-time timeline via Server-Sent Events
+//
+// Replays every event since `Last-Event-ID` (sent automatically by the
+// browser's EventSource on reconnect; also accepted as a `?lastEventId=`
+// query param for non-browser clients and tests) before switching to live
+// push. The event store's monotonic id is used as the SSE `id:` field, so
+// no event can be skipped or double-delivered across a reconnect.
+// ---------------------------------------------------------------------------
+router.get("/:id/stream", (req: Request, res: Response): void => {
+  const record = escrows.get(req.params.id);
+  if (!record) { notFound(res); return; }
+
+  const escrowId = record.id;
+
+  res.status(200);
+  res.set({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    // Disable proxy buffering (nginx) so events flush immediately.
+    "X-Accel-Buffering": "no",
+  });
+  res.flushHeaders();
+
+  function writeEvent(event: EscrowEvent): void {
+    // Written as a single frame so the id/event/data lines always arrive in
+    // one TCP chunk together — a partial write could otherwise let a
+    // reconnecting client observe an `id:` with no matching `data:` yet.
+    const data = JSON.stringify({
+      escrow_id: event.escrowId,
+      type: event.type,
+      state: event.state,
+      corridor: event.corridor,
+      amount_usdc: event.amountUsdc,
+      occurred_at: event.occurredAt,
+    });
+    res.write(`id: ${event.id}\nevent: escrow_event\ndata: ${data}\n\n`);
+  }
+
+  const lastEventIdHeader =
+    req.get("Last-Event-ID") ?? (req.query.lastEventId as string | undefined);
+  const lastEventId = lastEventIdHeader ? Number(lastEventIdHeader) : 0;
+
+  for (const event of escrowEventStore.since(escrowId, lastEventId)) {
+    writeEvent(event);
+  }
+
+  const unsubscribe = escrowEventStore.subscribe(escrowId, writeEvent);
+
+  const heartbeat = setInterval(() => {
+    res.write(": heartbeat\n\n");
+  }, SSE_HEARTBEAT_INTERVAL_MS);
+
+  req.on("close", () => {
+    clearInterval(heartbeat);
+    unsubscribe();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // POST /api/v1/escrow/:id/release — SEP-10 gated
 // ---------------------------------------------------------------------------
 router.post("/:id/release", requireSep10Ed25519, (req: Request, res: Response): void => {
@@ -112,6 +184,13 @@ router.post("/:id/release", requireSep10Ed25519, (req: Request, res: Response): 
 
   record.state = "Released";
   record.stateChangedAt = new Date();
+
+  escrowEventStore.append(record.id, {
+    type: "state_changed",
+    state: record.state,
+    corridor: record.corridor,
+    amountUsdc: record.amountUsdc,
+  });
 
   paymentSubmissionsTotal.inc({ status: "success", corridor: record.corridor });
 
@@ -135,6 +214,13 @@ router.post("/:id/dispute", requireSep10Ed25519, (req: Request, res: Response): 
 
   record.state = "Refundable";
   record.stateChangedAt = new Date();
+
+  escrowEventStore.append(record.id, {
+    type: "state_changed",
+    state: record.state,
+    corridor: record.corridor,
+    amountUsdc: record.amountUsdc,
+  });
 
   paymentSubmissionsTotal.inc({ status: "failure", corridor: record.corridor });
 

@@ -1,2 +1,10 @@
 target/
 Cargo.lock
+# api/node_modules is intentionally committed (existing repo convention) —
+# only the newer app/ and e2e/ packages are left uncommitted.
+app/node_modules/
+e2e/node_modules/
+app/dist/
+test-results/
+playwright-report/
+playwright/.cache/
