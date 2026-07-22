@@ -1,2 +1,23 @@
 target/
 Cargo.lock
+
+# ── Secrets & credentials ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Vault init output (contains unseal keys + root token — NEVER commit)
+init.json
+vault-init.json
+
+# TLS / PEM / private keys
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+
+# node_modules
+node_modules/
+

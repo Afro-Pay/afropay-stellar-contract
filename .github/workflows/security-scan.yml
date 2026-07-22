@@ -1,0 +1,251 @@
+# =============================================================================
+# .github/workflows/security-scan.yml
+# =============================================================================
+# Gitleaks secret scanning CI gate.
+#
+# Triggers
+# --------
+#   - Every pull_request (blocks merge if secrets are detected)
+#   - Every push to main/master (catches direct pushes)
+#   - Scheduled weekly scan of the full history (catches old commits)
+#
+# What it scans
+# -------------
+#   - Staged diff on PRs (fast — only new code)
+#   - Full repository history on schedule / main push (thorough)
+#   - Custom rule: Stellar secret seeds (S + 55 Base32 chars)
+#
+# How it blocks
+# -------------
+#   The job exits non-zero on any finding, which marks the PR check as failed
+#   and (with branch protection rules) prevents merge.
+#
+# Suppressing a false positive
+# ----------------------------
+#   Add an inline annotation comment on the SAME LINE as the value:
+#     MY_VAR="test-value"  # gitleaks:allow
+#   Or add a .gitleaks.toml allowlist entry (see docs/operations/secrets.md).
+# =============================================================================
+
+name: Secret Scanning (gitleaks)
+
+on:
+  pull_request:
+    branches: ["**"]
+  push:
+    branches: [main, master]
+  schedule:
+    # Full-history scan every Monday at 02:00 UTC
+    - cron: "0 2 * * 1"
+  workflow_dispatch:
+    inputs:
+      scan_depth:
+        description: "Number of commits to scan (0 = full history)"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+  # Required to post scan results as PR comments (optional — remove if not needed)
+  pull-requests: write
+
+jobs:
+  gitleaks:
+    name: Scan for committed secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Check out the repository
+      # -----------------------------------------------------------------------
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history for scheduled / push scans.
+          # On PRs the diff scan only needs the PR commits, but full history
+          # doesn't hurt and ensures nothing slips through.
+          fetch-depth: 0
+
+      # -----------------------------------------------------------------------
+      # 2. Write the custom gitleaks configuration
+      #    This file is written inline so the workflow is self-contained.
+      # -----------------------------------------------------------------------
+      - name: Write gitleaks config
+        run: |
+          cat > /tmp/gitleaks.toml << 'TOML'
+          # ===================================================================
+          # AfroPay gitleaks configuration
+          # ===================================================================
+          title = "AfroPay Secret Scan Rules"
+
+          # -------------------------------------------------------------------
+          # Extend the default ruleset with project-specific patterns
+          # -------------------------------------------------------------------
+
+          # Stellar secret seed  (starts with 'S', 55 more Base32 chars = 56 total)
+          [[rules]]
+          id          = "stellar-secret-seed"
+          description = "Stellar Ed25519 secret seed (strkey encoded)"
+          regex       = '''(?i)S[A-Z2-7]{55}'''
+          tags        = ["stellar", "key", "high-severity"]
+          keywords    = ["stellar", "seed", "secret", "signing"]
+
+          # Stellar signing seed exposed in env assignment
+          [[rules]]
+          id          = "stellar-seed-env"
+          description = "Stellar secret seed in environment variable assignment"
+          regex       = '''(?i)(SEP10_SIGNING_SEED|STELLAR_SEED|SIGNING_SEED|RELAYER_SEED)\s*[=:]\s*['"]?S[A-Z2-7]{55}['"]?'''
+          tags        = ["stellar", "env", "critical"]
+
+          # Vault token
+          [[rules]]
+          id          = "vault-token"
+          description = "HashiCorp Vault token"
+          regex       = '''(?i)(vault_token|VAULT_TOKEN)\s*[=:]\s*['"]?[shb]\.[a-zA-Z0-9]{24,}['"]?'''
+          tags        = ["vault", "token"]
+
+          # Generic high-entropy private key block
+          [[rules]]
+          id          = "private-key-block"
+          description = "PEM private key block"
+          regex       = '''-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----'''
+          tags        = ["pem", "key"]
+
+          # Postgres DSN with embedded password
+          [[rules]]
+          id          = "postgres-dsn"
+          description = "Postgres connection string with embedded password"
+          regex       = '''postgres(?:ql)?://[^:]+:([^@\s]{8,})@'''
+          tags        = ["postgres", "credential"]
+          secretGroup = 1
+
+          # Redis URL with password
+          [[rules]]
+          id          = "redis-url-password"
+          description = "Redis URL with embedded password"
+          regex       = '''redis(?:s)?://[^:@]+:([^@\s]{8,})@'''
+          tags        = ["redis", "credential"]
+          secretGroup = 1
+
+          # -------------------------------------------------------------------
+          # Allowlists — test fixtures and documentation placeholders
+          # -------------------------------------------------------------------
+          [allowlist]
+          description = "Known safe patterns — test vectors, docs, and placeholders"
+
+          # Commit SHAs that were audited and confirmed false-positive
+          commits = []
+
+          # Regex patterns that are known-safe (e.g., documentation examples)
+          regexes = [
+            # Placeholder seeds in documentation and runbooks
+            '''REPLACE_ME_STELLAR''',
+            '''EXAMPLE_STELLAR_SEED''',
+            '''SCEXAMPLE[A-Z2-7]+''',
+            # Test-only seeds (test vectors from Stellar SDK)
+            '''SCZANGBA''',
+            # gitleaks own test fixtures
+            '''gitleaks''',
+          ]
+
+          # File paths to exclude from scanning
+          paths = [
+            # Compiled output — not committed but safe to skip
+            '''.*/dist/.*''',
+            '''.*/node_modules/.*''',
+            # Lockfiles contain package hashes that can false-positive
+            '''.*package-lock\.json''',
+            '''.*yarn\.lock''',
+            # Cargo lock
+            '''.*Cargo\.lock''',
+          ]
+          TOML
+
+      # -----------------------------------------------------------------------
+      # 3. Run gitleaks
+      # -----------------------------------------------------------------------
+      - name: Run gitleaks (PR diff scan)
+        if: github.event_name == 'pull_request'
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Point to our custom config
+          GITLEAKS_CONFIG: /tmp/gitleaks.toml
+          # Only scan commits added by this PR
+          GITLEAKS_ENABLE_COMMENTS: "true"
+
+      - name: Run gitleaks (full history scan)
+        if: github.event_name != 'pull_request'
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: /tmp/gitleaks.toml
+
+      # -----------------------------------------------------------------------
+      # 4. Upload SARIF report (GitHub Code Scanning — optional but recommended)
+      # -----------------------------------------------------------------------
+      - name: Upload SARIF results to GitHub Security tab
+        if: always() && hashFiles('results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+        continue-on-error: true  # Don't fail if SARIF upload is unavailable
+
+  # ---------------------------------------------------------------------------
+  # Separate job: validate no Stellar seeds are hard-coded in config files
+  # ---------------------------------------------------------------------------
+  check-config-files:
+    name: Check config files for embedded secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Scan docker-compose files for embedded secrets
+        run: |
+          echo "Checking docker-compose files for hard-coded secrets..."
+          # Fail if any docker-compose file contains a real Stellar seed
+          if grep -rE 'S[A-Z2-7]{55}' \
+            $(find . -name 'docker-compose*.yml' -not -path '*/node_modules/*') \
+            2>/dev/null; then
+            echo "::error::Stellar secret seed found in docker-compose file!"
+            exit 1
+          fi
+          echo "OK — no Stellar seeds found in docker-compose files."
+
+      - name: Scan .env files for committed secrets
+        run: |
+          echo "Checking for committed .env files with real secrets..."
+          # .env.example / .env.template are OK — real .env files are not
+          committed_envs=$(git ls-files | grep -E '^\.env$|^.*\/\.env$' || true)
+          if [ -n "$committed_envs" ]; then
+            echo "::error::Real .env file is tracked by git: $committed_envs"
+            echo "Add .env to .gitignore and rotate any secrets that were committed."
+            exit 1
+          fi
+          echo "OK — no .env files committed."
+
+      - name: Verify .gitignore covers secret files
+        run: |
+          echo "Verifying .gitignore entries for sensitive files..."
+          required_patterns=(
+            "\.env"
+            "init\.json"
+            "\*\.pem"
+            "\*\.key"
+          )
+          missing=()
+          for pattern in "${required_patterns[@]}"; do
+            if ! grep -qE "$pattern" .gitignore 2>/dev/null; then
+              missing+=("$pattern")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::warning::The following patterns are not in .gitignore: ${missing[*]}"
+            echo "Consider adding them to prevent accidental secret commits."
+          else
+            echo "OK — .gitignore covers all required secret file patterns."
+          fi
