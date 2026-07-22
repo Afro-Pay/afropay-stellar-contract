@@ -1,0 +1,44 @@
+# ── .dockerignore.contracts ───────────────────────────────────────────────────
+# Excludes files not needed when building Dockerfile.contracts.
+
+# Node.js directories
+api/
+services/
+load-tests/
+node_modules/
+
+# Compiled JS output
+api/dist/
+services/*/dist/
+
+# Infrastructure and docs
+infrastructure/
+docs/
+ci/
+scripts/
+public/
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+
+# Git
+.git/
+.github/
+.gitignore
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
+
+# Pre-built Rust artifacts are handled by cargo-chef caching inside the image.
+# We include Cargo.toml and src/ so DO NOT exclude them here.
+# Exclude only the local target/ directory to avoid upload bloat.
+target/
+
+# Test result files
+load-tests/results/

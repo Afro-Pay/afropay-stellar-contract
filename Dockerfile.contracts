@@ -1,0 +1,104 @@
+# ============================================================
+# Dockerfile.contracts — Soroban Contract Builder & CLI
+# ============================================================
+# Pins soroban-cli to 21.0.0 to EXACTLY match the soroban-sdk
+# version declared in contracts/escrow/Cargo.toml (soroban-sdk = "21.0.0").
+#
+# Version alignment table:
+#   soroban-sdk (contracts/escrow/Cargo.toml) : 21.0.0
+#   soroban-cli (this Dockerfile)             : 21.0.0  ← must match
+#
+# Stages:
+#   cargo-chef-planner — generate dependency recipe for layer caching
+#   cargo-chef-cook    — fetch & compile all dependencies (cached layer)
+#   builder            — compile the WASM contract
+#   cli                — slim image with soroban-cli for deploy / invoke
+# ============================================================
+
+# ── Base: Rust stable with wasm32 target ─────────────────────────────────────
+FROM rust:1.81-slim-bookworm AS rust-base
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libssl-dev curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add wasm32-unknown-unknown
+
+# ── Stage 1: cargo-chef planner ──────────────────────────────────────────────
+FROM rust-base AS cargo-chef-planner
+
+RUN cargo install cargo-chef --version 0.1.68 --locked
+
+WORKDIR /workspace
+
+# Copy workspace Cargo.toml and contracts Cargo.toml for recipe generation
+COPY Cargo.toml ./
+COPY contracts/escrow/Cargo.toml ./contracts/escrow/
+COPY contracts/escrow/src/ ./contracts/escrow/src/
+
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ── Stage 2: cargo-chef cook (dependency compilation — cached) ───────────────
+FROM rust-base AS cargo-chef-cook
+
+RUN cargo install cargo-chef --version 0.1.68 --locked
+
+WORKDIR /workspace
+
+COPY --from=cargo-chef-planner /workspace/recipe.json ./
+
+# Build dependencies only — this layer is reused on source-only changes
+RUN cargo chef cook --release --target wasm32-unknown-unknown --recipe-path recipe.json
+
+# ── Stage 3: Contract builder ─────────────────────────────────────────────────
+FROM rust-base AS builder
+
+WORKDIR /workspace
+
+# Copy pre-compiled dependency artifacts
+COPY --from=cargo-chef-cook /workspace/target ./target
+COPY --from=cargo-chef-cook /usr/local/cargo /usr/local/cargo
+
+# Copy actual source
+COPY Cargo.toml ./
+COPY contracts/ ./contracts/
+COPY src/ ./src/
+
+# Build the escrow contract as WASM
+RUN cargo build --release --target wasm32-unknown-unknown \
+    --manifest-path contracts/escrow/Cargo.toml
+
+# Optimise the WASM binary (strip + opt)
+RUN ls target/wasm32-unknown-unknown/release/*.wasm 2>/dev/null || \
+    echo "No WASM artifacts found in workspace target; checking contract target..." && \
+    find target -name "*.wasm" -type f
+
+# ── Stage 4: CLI runtime image ────────────────────────────────────────────────
+# This stage is the container used in docker-compose.dev.yml for:
+#   - deploying the contract to the local soroban network
+#   - running soroban contract invoke commands from setup scripts
+FROM debian:bookworm-slim AS cli
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Install soroban-cli pinned to 21.0.0
+# soroban-cli 21.x is the stable-release matching soroban-sdk 21.x
+RUN curl -L \
+    https://github.com/stellar/stellar-cli/releases/download/v21.0.0/stellar-cli-21.0.0-x86_64-unknown-linux-gnu.tar.gz \
+    -o /tmp/stellar-cli.tar.gz \
+ && tar -xzf /tmp/stellar-cli.tar.gz -C /usr/local/bin \
+ && rm /tmp/stellar-cli.tar.gz \
+ && stellar --version
+
+# Copy compiled WASM artifact from builder stage
+COPY --from=builder /workspace/target/wasm32-unknown-unknown/release/ /contracts/wasm/
+
+WORKDIR /contracts
+
+# Verify the CLI version matches the expected soroban-sdk version
+RUN stellar --version | grep -q "21\." || \
+    (echo "ERROR: soroban-cli version mismatch — expected 21.x" && exit 1)
+
+CMD ["stellar", "--help"]

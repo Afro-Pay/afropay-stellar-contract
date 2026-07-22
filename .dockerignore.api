@@ -1,0 +1,48 @@
+# ── api/.dockerignore ────────────────────────────────────────────────────────
+# Excludes files that should not be sent to the Docker build context
+# when building Dockerfile.api from the repo root.
+
+# Compiled output (builder stage compiles from source)
+api/dist/
+
+# Test artifacts
+api/__tests__/
+api/jest.config.json
+
+# Node modules (installed fresh in the container)
+api/node_modules/
+node_modules/
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+
+# Git and CI
+.git/
+.github/
+.gitignore
+
+# Other service directories not needed for the API image
+services/
+contracts/
+infrastructure/
+db/
+docs/
+load-tests/
+src/
+tests/
+ci/
+scripts/
+
+# Rust build artifacts
+target/
+Cargo.lock
+
+# Log files
+*.log
+npm-debug.log*
+
+# OS artefacts
+.DS_Store
+Thumbs.db
