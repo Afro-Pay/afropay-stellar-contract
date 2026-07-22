@@ -1,0 +1,14 @@
+{
+  "name": "afropay-e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Playwright e2e tests for the AfroPay web app (Issue #24: escrow SSE timeline)",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.10.0",
+    "@playwright/test": "^1.47.2"
+  }
+}
