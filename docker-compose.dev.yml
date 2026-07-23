@@ -1,0 +1,257 @@
+# ============================================================
+# docker-compose.dev.yml — AfroPay Local Development Stack
+# ============================================================
+# Run the full AfroPay stack with a single command:
+#   bash scripts/dev-setup.sh
+#
+# Services
+# --------
+#   postgres         — Primary database (port 5432)
+#   redis            — Cache / BullMQ job queue (port 6379)
+#   api              — AfroPay Anchor API (port 8000)
+#   listener         — Horizon SSE listener (internal)
+#   reconciliation   — Chain-vs-DB reconciliation (port 8001)
+#   oracle           — FX rate aggregator (port 8002)
+#   contracts        — Soroban contract builder + stellar-cli (one-shot)
+#
+# Profiles
+# --------
+#   default  — postgres, redis, api               (always on)
+#   services — listener, reconciliation, oracle   (--profile services)
+#   contracts — contracts builder                 (--profile contracts)
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml up           # core stack
+#   docker compose -f docker-compose.dev.yml --profile services up   # + services
+#   docker compose -f docker-compose.dev.yml --profile contracts run contracts
+# ============================================================
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# ── Shared environment fragments ─────────────────────────────────────────────
+x-postgres-env: &postgres-env
+  PGHOST: postgres
+  PGPORT: "5432"
+  PGDATABASE: afropay
+  PGUSER: afropay
+  PGPASSWORD: afropay_dev_password
+
+x-node-common-env: &node-common-env
+  NODE_ENV: development
+  LOG_LEVEL: debug
+  # Stellar testnet
+  NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+  HORIZON_URL: https://horizon-testnet.stellar.org
+  # These MUST be overridden in .env for real use; defaults allow a clean first boot.
+  # Generate with: node -e "const {Keypair}=require('@stellar/stellar-sdk'); const kp=Keypair.random(); console.log('Seed:', kp.secret(), '\nPublicKey:', kp.publicKey())"
+  SEP10_SIGNING_SEED: ${SEP10_SIGNING_SEED:-SBMWGFMKDMUXQFJFG7M6MLXHRGFVLGRFHCVXVRCMRGUYSNWPYONBHVFT}
+  JWT_SECRET: ${JWT_SECRET:-dev-jwt-secret-replace-in-production-32chars}
+  MASTER_ENCRYPTION_KEY: ${MASTER_ENCRYPTION_KEY:-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=}
+  HOME_DOMAIN: localhost:8000
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16.3-alpine3.20
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: afropay
+      POSTGRES_USER: afropay
+      POSTGRES_PASSWORD: afropay_dev_password
+      # Tune for local dev (less WAL overhead)
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # SQL migrations run automatically on first start via initdb.d
+      - ./db/migrations:/docker-entrypoint-initdb.d/01_core:ro
+      - ./api/migrations:/docker-entrypoint-initdb.d/02_api:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U afropay -d afropay"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    logging: *default-logging
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.2.5-alpine3.20
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save ""
+      --appendonly no
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    logging: *default-logging
+
+  # ── Anchor API ──────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+      target: runner
+    image: afropay-api:dev
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: [*postgres-env, *node-common-env]
+      PORT: "8000"
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://afropay:afropay_dev_password@postgres:5432/afropay
+      STELLAR_TOML_PATH: /app/public/.well-known/stellar.toml
+    ports:
+      - "8000:8000"
+    volumes:
+      # Hot-reload source in development: mount dist/ output
+      # (run `npm run build --watch` in api/ on the host to get live TS compilation)
+      - ./api/dist:/app/dist:ro
+      - ./public:/app/public:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/health | grep -q 'ok\\|degraded'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging: *default-logging
+
+  # ── Horizon Listener ────────────────────────────────────────────────────────
+  listener:
+    build:
+      context: .
+      dockerfile: Dockerfile.listener
+    image: afropay-listener:dev
+    restart: unless-stopped
+    profiles: ["services"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    environment:
+      <<: [*postgres-env, *node-common-env]
+      DATABASE_URL: postgresql://afropay:afropay_dev_password@postgres:5432/afropay
+      CONTRACT_ID: ${CONTRACT_ID:-}
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'node dist/index.js' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
+
+  # ── Reconciliation Service ──────────────────────────────────────────────────
+  reconciliation:
+    build:
+      context: .
+      dockerfile: Dockerfile.reconciliation
+    image: afropay-reconciliation:dev
+    restart: unless-stopped
+    profiles: ["services"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: [*postgres-env, *node-common-env]
+      DATABASE_URL: postgresql://afropay:afropay_dev_password@postgres:5432/afropay
+      PORT: "8001"
+      ADMIN_JWT_SECRET: ${JWT_SECRET:-dev-jwt-secret-replace-in-production-32chars}
+    ports:
+      - "8001:8001"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8001/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
+
+  # ── Oracle / Rate Aggregator ────────────────────────────────────────────────
+  oracle:
+    build:
+      context: .
+      dockerfile: Dockerfile.oracle
+    image: afropay-oracle:dev
+    restart: unless-stopped
+    profiles: ["services"]
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *node-common-env
+      PORT: "8002"
+      REDIS_URL: redis://redis:6379
+      # Rate provider API keys — leave blank to use stub/mock provider in dev
+      FLUTTERWAVE_SECRET_KEY: ${FLUTTERWAVE_SECRET_KEY:-}
+      CBN_API_KEY: ${CBN_API_KEY:-}
+    ports:
+      - "8002:8002"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8002/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    logging: *default-logging
+
+  # ── Soroban Contract Builder / CLI ──────────────────────────────────────────
+  # One-shot service — does not stay running.  Used by dev-setup.sh to:
+  #   1. Compile the escrow contract WASM
+  #   2. Deploy it to the Stellar testnet (or local standalone via soroban-rpc)
+  #   3. Print the deployed contract ID
+  contracts:
+    build:
+      context: .
+      dockerfile: Dockerfile.contracts
+      target: cli
+    image: afropay-contracts:dev
+    profiles: ["contracts"]
+    environment:
+      SOROBAN_RPC_URL: ${SOROBAN_RPC_URL:-https://soroban-testnet.stellar.org}
+      SOROBAN_NETWORK_PASSPHRASE: ${NETWORK_PASSPHRASE:-Test SDF Network ; September 2015}
+      # DEPLOYER_SECRET must be set in .env — the key used to deploy the contract
+      DEPLOYER_SECRET: ${DEPLOYER_SECRET:-}
+    volumes:
+      # Mount contracts source so WASM can be rebuilt on source changes
+      - ./contracts:/contracts/src:ro
+      # Persist deployed contract IDs between runs
+      - contract_ids:/contracts/deployed
+    # Default: print contract info; override CMD when deploying
+    command: ["stellar", "--version"]
+    logging: *default-logging
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  contract_ids:
+    driver: local
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  default:
+    name: afropay-dev
+    driver: bridge

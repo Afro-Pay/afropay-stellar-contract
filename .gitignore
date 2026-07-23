@@ -1,10 +1,23 @@
 target/
 Cargo.lock
-# api/node_modules is intentionally committed (existing repo convention) —
-# only the newer app/ and e2e/ packages are left uncommitted.
-app/node_modules/
-e2e/node_modules/
-app/dist/
-test-results/
-playwright-report/
-playwright/.cache/
+
+# ── Secrets & credentials ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+!.env.template
+
+# Vault init output (contains unseal keys + root token — NEVER commit)
+init.json
+vault-init.json
+
+# TLS / PEM / private keys
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+
+# node_modules
+node_modules/
+
