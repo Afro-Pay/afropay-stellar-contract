@@ -1,0 +1,54 @@
+name: PWA Offline Tests (Issue #21)
+
+on:
+  pull_request:
+    paths:
+      - "app/**"
+      - "e2e/pwa-offline.spec.ts"
+  push:
+    paths:
+      - "app/**"
+      - "e2e/pwa-offline.spec.ts"
+
+jobs:
+  pwa-offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install app dependencies
+        run: npm ci
+        working-directory: app
+
+      - name: Build app (includes PWA manifest + service worker generation)
+        run: npm run build
+        working-directory: app
+
+      - name: Install e2e dependencies
+        run: npm ci
+        working-directory: e2e
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+        working-directory: e2e
+
+      - name: Run PWA offline Playwright tests
+        run: npx playwright test pwa-offline.spec.ts --reporter=list
+        working-directory: e2e
+        env:
+          CI: "true"
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: playwright-report-pwa-offline
+          path: e2e/playwright-report/
+          retention-days: 7

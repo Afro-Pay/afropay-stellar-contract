@@ -1,0 +1,105 @@
+.offline-page {
+  align-items: center;
+  background: #f8f9fa;
+  display: flex;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 2rem 1rem;
+}
+
+.offline-page__card {
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+  max-width: 480px;
+  padding: 2.5rem 2rem;
+  width: 100%;
+}
+
+/* Connectivity indicator */
+.offline-page__indicator {
+  align-items: center;
+  border-radius: 20px;
+  display: inline-flex;
+  font-size: 0.875rem;
+  font-weight: 600;
+  gap: 0.5rem;
+  margin-bottom: 1.5rem;
+  padding: 0.35rem 0.9rem;
+}
+
+.offline-page__indicator--offline {
+  background: #fff3cd;
+  color: #856404;
+}
+
+.offline-page__indicator--online {
+  background: #d1e7dd;
+  color: #0f5132;
+}
+
+.offline-page__dot {
+  border-radius: 50%;
+  display: inline-block;
+  height: 0.6rem;
+  width: 0.6rem;
+}
+
+.offline-page__indicator--offline .offline-page__dot {
+  background: #ffc107;
+}
+
+.offline-page__indicator--online .offline-page__dot {
+  background: #198754;
+}
+
+.offline-page__title {
+  color: #212529;
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin: 0 0 0.75rem;
+}
+
+.offline-page__body {
+  color: #495057;
+  line-height: 1.6;
+  margin: 0 0 1.25rem;
+}
+
+.offline-page__queue {
+  background: #e8f4fd;
+  border-radius: 6px;
+  color: #0c63e4;
+  font-size: 0.9rem;
+  font-weight: 500;
+  margin-bottom: 1.25rem;
+  padding: 0.6rem 0.9rem;
+}
+
+.offline-page__available {
+  color: #198754;
+  font-size: 0.9rem;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.offline-page__available li {
+  margin-bottom: 0.4rem;
+}
+
+.offline-page__cta {
+  background: #1a1a2e;
+  border-radius: 8px;
+  color: #fff;
+  display: inline-block;
+  font-weight: 600;
+  margin-top: 1rem;
+  padding: 0.65rem 1.5rem;
+  text-decoration: none;
+  transition: background 0.2s;
+}
+
+.offline-page__cta:hover {
+  background: #2d2d5e;
+}
