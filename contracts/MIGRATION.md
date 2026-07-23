@@ -247,6 +247,8 @@ cd contracts/escrow
 cargo test --features testutils upgrade -- --nocapture
 ```
 
+The harness is located at `contracts/tests/upgrade/simulation_test.rs`.
+
 ### Run the full test suite after adding a migration
 
 ```bash
@@ -255,17 +257,91 @@ cargo test --features testutils -- --nocapture
 PROPTEST_CASES=100000 cargo test --features testutils -- --nocapture
 ```
 
+### Upgrade Regression Test Harness (Issue #29)
+
+The harness in `contracts/tests/upgrade/simulation_test.rs` provides full
+regression coverage for every v→v+1 migration pair.
+
+#### What it seeds
+
+Before calling `migrate()`, the harness seeds **5 representative escrow states**
+that cover the full state machine:
+
+| State | How it's reached |
+|-------|-----------------|
+| `Pending` | `create_escrow()` |
+| `Funded` | `create_escrow()` → `fund_escrow()` |
+| `Disputed` | `create_escrow()` → `fund_escrow()` → `dispute_escrow()` |
+| `Released` | `create_escrow()` → `fund_escrow()` → `release_escrow()` |
+| `Refunded` | `create_escrow()` → `fund_escrow()` → *(ledger time > timelock)* → `refund_escrow()` |
+
+#### What it asserts post-migration
+
+For each of the 5 records:
+- `state` field matches the expected value
+- `amount` field is exactly `1_000_000` (unchanged)
+- `sender`, `beneficiary`, `arbitrator` party addresses are unchanged
+- Relevant timestamp fields (`funded_at`, `disputed_at`, etc.) are preserved
+
+#### What operations it tests post-migration
+
+| Test | Post-migration operation |
+|------|--------------------------|
+| `test_pending_can_be_funded_after_migration` | `fund_escrow()` on Pending |
+| `test_funded_can_be_released_after_migration` | `release_escrow()` on Funded |
+| `test_funded_can_be_disputed_after_migration` | `dispute_escrow()` on Funded |
+| `test_disputed_can_be_resolved_after_migration` | `resolve_dispute()` on Disputed |
+| `test_released_is_terminal_after_migration` | `fund_escrow()` on Released → must fail |
+| `test_refunded_is_terminal_after_migration` | `fund_escrow()` on Refunded → must fail |
+| `test_create_new_escrow_after_migration` | `create_escrow()` under V2 schema |
+| `test_full_lifecycle_post_migration` | Pending→Funded→Released end-to-end |
+| `test_dispute_resolve_lifecycle_post_migration` | Funded→Disputed→Resolved end-to-end |
+
+#### Broken migration detection
+
+`test_broken_migration_detected_by_harness` documents and validates that the
+harness assertions will catch a faulty `migrate()` that drops or corrupts
+storage keys.  A deliberately broken migration (e.g., one that drops an escrow
+key) would cause `get_escrow()` to panic with `"Escrow not found"`, surfacing
+as a descriptive test failure rather than a silent data loss.
+
+#### Parameterising for a new v→v+1 pair
+
+The `run_upgrade_harness()` helper accepts a `HarnessConfig`:
+
+```rust
+pub struct HarnessConfig {
+    /// Human-readable label printed in assertion failure messages.
+    pub label: &'static str,
+}
+```
+
+To test a new migration pair (e.g., V2→V3):
+
+1. Create or import the V3 contract type.
+2. Instantiate `HarnessConfig { label: "V2 → V3" }`.
+3. Call `run_upgrade_harness(&cfg)` — it will deploy, seed, migrate, and assert.
+4. Add targeted operation tests for any new fields or behaviours introduced in V3.
+
 ### What the simulation tests cover
 
 | Test | Verifies |
 |------|---------|
 | `test_initialize_sets_schema_v1` | `initialize()` writes V1 schema version |
-| `test_migrate_advances_schema_version` | `migrate()` advances to `TARGET_VERSION` |
-| `test_migrate_is_idempotent` | Second call is a no-op |
+| `test_all_five_states_intact_after_migration` | All 5 seeded states readable post-migration |
+| `test_pending_can_be_funded_after_migration` | Pending→Funded works post-migration |
+| `test_funded_can_be_released_after_migration` | Funded→Released works post-migration |
+| `test_funded_can_be_disputed_after_migration` | Funded→Disputed works post-migration |
+| `test_disputed_can_be_resolved_after_migration` | Disputed→Resolved works post-migration |
+| `test_released_is_terminal_after_migration` | Released rejects further transitions |
+| `test_refunded_is_terminal_after_migration` | Refunded rejects further transitions |
+| `test_create_new_escrow_after_migration` | New records created under V2 schema |
+| `test_migrate_is_idempotent` | Second migrate() call is a no-op |
 | `test_migrate_rejects_non_admin` | Non-admin receives `Unauthorized` |
-| `test_v1_state_intact_after_migration` | All seeded V1 records readable post-migration |
-| `test_escrow_operations_work_after_migration` | State machine works on migrated records |
-| `test_create_escrow_after_migration` | New records can be created post-migration |
+| `test_broken_migration_detected_by_harness` | Harness catches faulty migrate() |
+| `test_target_version_is_v2` | TARGET_VERSION compile-time assertion |
+| `test_full_lifecycle_post_migration` | Pending→Funded→Released end-to-end |
+| `test_dispute_resolve_lifecycle_post_migration` | Funded→Disputed→Resolved end-to-end |
 
 ---
 
