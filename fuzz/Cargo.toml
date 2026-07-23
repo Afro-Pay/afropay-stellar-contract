@@ -1,0 +1,20 @@
+[package]
+name = "remittance-fuzz"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+soroban-sdk = "21.0.0"
+
+[dependencies.remittance]
+path = "../contracts/remittance"
+
+[[bin]]
+name = "remittance_fees"
+path = "fuzz_targets/remittance_fees.rs"
+test = false
+doc = false

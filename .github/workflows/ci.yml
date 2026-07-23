@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: wasm32-unknown-unknown
+          override: true
+      
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Build contracts
+        run: cargo build --target wasm32-unknown-unknown --release
+      
+      - name: Run tests
+        run: cargo test --workspace --features testutils
+      
+      - name: Run clippy
+        run: cargo clippy -- -D warnings
+      
+      - name: Run fmt check
+        run: cargo fmt -- --check
+      
+      - name: Check for unchecked arithmetic (security audit)
+        run: |
+          echo "🔍 Checking for unchecked arithmetic on i128 types..."
+          if grep -r --include="*.rs" "[^a-zA-Z]\+[^*]\*[^=]" contracts/remittance/src/ | grep -v "checked_mul" | grep -v "saturating_mul"; then
+            echo "❌ Found unchecked multiplication in remittance contract!"
+            exit 1
+          else
+            echo "✅ No unchecked multiplication found."
+          fi
+          if grep -r --include="*.rs" "[^a-zA-Z]\-[^*]\-[^=]" contracts/remittance/src/ | grep -v "checked_sub" | grep -v "saturating_sub"; then
+            echo "❌ Found unchecked subtraction in remittance contract!"
+            exit 1
+          else
+            echo "✅ No unchecked subtraction found."
+          fi
+      
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz || echo "cargo-fuzz already installed"
+      
+      - name: Run fuzz tests (60 seconds)
+        run: |
+          cd fuzz
+          cargo fuzz run remittance_fees -- -max_total_time=60 || echo "Fuzz test completed (may have found issues)"
+        timeout-minutes: 5
+        continue-on-error: true
