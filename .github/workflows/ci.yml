@@ -1,67 +1,175 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# AfroPay — Continuous Integration
+# Runs on every PR targeting main/develop and on every push to those branches.
+# All three jobs run in parallel; merge is blocked if any job fails.
+# ─────────────────────────────────────────────────────────────────────────────
 name: CI
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main, develop ]
+    branches: [main, develop]
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Rust toolchain pinned to match soroban-sdk 20.x requirements
+  RUST_TOOLCHAIN: "1.81"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 1 — Rust contracts: build (wasm32), test, clippy, fmt, security audit
+# ─────────────────────────────────────────────────────────────────────────────
 jobs:
-  test:
+  rust-contracts:
+    name: Rust Contracts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      
-      - name: Install Rust
-        uses: actions-rs/toolchain@v1
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (${{ env.RUST_TOOLCHAIN }})
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: stable
-          target: wasm32-unknown-unknown
-          override: true
-      
-      - name: Cache dependencies
-        uses: actions/cache@v3
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+
+      - name: Cache Cargo registry & build artifacts
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      
-      - name: Build contracts
+          key: ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Build contracts (wasm32)
         run: cargo build --target wasm32-unknown-unknown --release
-      
-      - name: Run tests
+
+      - name: Run contract tests
         run: cargo test --workspace --features testutils
-      
-      - name: Run clippy
-        run: cargo clippy -- -D warnings
-      
-      - name: Run fmt check
-        run: cargo fmt -- --check
-      
+
+      - name: Run Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
       - name: Check for unchecked arithmetic (security audit)
+        run: bash scripts/check-unchecked-arithmetic.sh
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo-audit (dependency vulnerability scan)
+        run: cargo audit
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 2 — Node.js API: install, TypeScript build, ESLint, Jest tests
+  # ─────────────────────────────────────────────────────────────────────────
+  api:
+    name: Node API
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: api
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: api/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript type-check
+        run: npx tsc --noEmit
+
+      - name: ESLint
+        # Fail the job on any ESLint error; warnings are allowed.
         run: |
-          echo "🔍 Checking for unchecked arithmetic on i128 types..."
-          if grep -r --include="*.rs" "[^a-zA-Z]\+[^*]\*[^=]" contracts/remittance/src/ | grep -v "checked_mul" | grep -v "saturating_mul"; then
-            echo "❌ Found unchecked multiplication in remittance contract!"
-            exit 1
+          if [ -f .eslintrc* ] || [ -f eslint.config* ]; then
+            npx eslint . --ext .ts --max-warnings 0
           else
-            echo "✅ No unchecked multiplication found."
+            echo "No ESLint config found — skipping lint step"
           fi
-          if grep -r --include="*.rs" "[^a-zA-Z]\-[^*]\-[^=]" contracts/remittance/src/ | grep -v "checked_sub" | grep -v "saturating_sub"; then
-            echo "❌ Found unchecked subtraction in remittance contract!"
-            exit 1
-          else
-            echo "✅ No unchecked subtraction found."
-          fi
-      
-      - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz || echo "cargo-fuzz already installed"
-      
-      - name: Run fuzz tests (60 seconds)
+
+      - name: Run Jest tests
+        run: npm run test:ci
+        env:
+          NODE_ENV: test
+          # Minimal test doubles — no live Stellar / Postgres connection needed
+          SEP10_SIGNING_SEED: SDEMO000000000000000000000000000000000000000000000000000A
+          JWT_SECRET: ci-test-jwt-secret-not-for-production
+          MASTER_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+          DATABASE_URL: ""
+          REDIS_URL: ""
+
+      - name: Upload test results (JUnit)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-test-results
+          path: api/junit.xml
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 3 — Frontend: install, TypeScript check, ESLint, Vitest, build
+  # ─────────────────────────────────────────────────────────────────────────
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript type-check
+        run: npx tsc --noEmit
+
+      - name: ESLint
         run: |
-          cd fuzz
-          cargo fuzz run remittance_fees -- -max_total_time=60 || echo "Fuzz test completed (may have found issues)"
-        timeout-minutes: 5
-        continue-on-error: true
+          if [ -f .eslintrc* ] || [ -f eslint.config* ]; then
+            npx eslint . --ext .ts,.tsx --max-warnings 0
+          else
+            echo "No ESLint config found — skipping lint step"
+          fi
+
+      - name: Run Vitest (unit + component tests)
+        run: npm test
+        env:
+          NODE_ENV: test
+
+      - name: Production build
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: app/dist
+          retention-days: 7

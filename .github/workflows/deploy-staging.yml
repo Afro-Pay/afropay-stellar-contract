@@ -1,0 +1,283 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# AfroPay — Staging Deployment
+#
+# Triggers  : push to main (after CI passes), or manual dispatch
+# Flow      : build & push Docker images → deploy to staging → k6 smoke test
+#             → pass: tag images as stable  |  fail: kubectl rollout undo
+#
+# Required secrets (set in repo Settings → Secrets → Actions):
+#   KUBECONFIG_STAGING   — base64-encoded kubeconfig for the staging cluster
+#   KUBE_NAMESPACE       — Kubernetes namespace (e.g. afropay-staging)
+#
+# Required variables (Settings → Variables → Actions):
+#   STAGING_API_URL      — base URL of the staging API (e.g. https://api.staging.afropay.io)
+# ─────────────────────────────────────────────────────────────────────────────
+name: Deploy — Staging
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (default: sha of current commit)"
+        required: false
+        default: ""
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false   # never cancel a running deployment
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_API: ghcr.io/${{ github.repository_owner }}/afropay-api
+  IMAGE_FRONTEND: ghcr.io/${{ github.repository_owner }}/afropay-frontend
+  KUBE_NAMESPACE: ${{ vars.KUBE_NAMESPACE || 'afropay-staging' }}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 1 — Build and push Docker images to GHCR
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  build-and-push:
+    name: Build & Push Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          TAG="${{ github.event.inputs.image_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="${{ github.sha }}"
+          fi
+          echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Image tag: ${TAG}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.api
+          push: true
+          tags: |
+            ${{ env.IMAGE_API }}:${{ steps.meta.outputs.version }}
+            ${{ env.IMAGE_API }}:staging-latest
+          cache-from: type=registry,ref=${{ env.IMAGE_API }}:buildcache
+          cache-to:   type=registry,ref=${{ env.IMAGE_API }}:buildcache,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+
+      - name: Build and push Frontend image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.frontend
+          push: true
+          tags: |
+            ${{ env.IMAGE_FRONTEND }}:${{ steps.meta.outputs.version }}
+            ${{ env.IMAGE_FRONTEND }}:staging-latest
+          cache-from: type=registry,ref=${{ env.IMAGE_FRONTEND }}:buildcache
+          cache-to:   type=registry,ref=${{ env.IMAGE_FRONTEND }}:buildcache,mode=max
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 2 — Deploy to staging Kubernetes cluster
+  # ─────────────────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_API_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Snapshot current rollout revision (for rollback)
+        id: snapshot
+        run: |
+          API_REV=$(kubectl rollout history deployment/afropay-api \
+            -n "${{ env.KUBE_NAMESPACE }}" \
+            --output=jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}' \
+            2>/dev/null || echo "0")
+          FRONTEND_REV=$(kubectl rollout history deployment/afropay-frontend \
+            -n "${{ env.KUBE_NAMESPACE }}" \
+            --output=jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}' \
+            2>/dev/null || echo "0")
+          echo "api_revision=${API_REV}" >> "$GITHUB_OUTPUT"
+          echo "frontend_revision=${FRONTEND_REV}" >> "$GITHUB_OUTPUT"
+          echo "Snapshotted: API rev ${API_REV}, Frontend rev ${FRONTEND_REV}"
+
+      - name: Update image tags in staging (rolling update)
+        run: |
+          IMAGE_TAG="${{ needs.build-and-push.outputs.image_tag }}"
+          echo "Deploying image tag: ${IMAGE_TAG}"
+
+          kubectl set image deployment/afropay-api \
+            api="${{ env.IMAGE_API }}:${IMAGE_TAG}" \
+            -n "${{ env.KUBE_NAMESPACE }}"
+
+          kubectl set image deployment/afropay-frontend \
+            frontend="${{ env.IMAGE_FRONTEND }}:${IMAGE_TAG}" \
+            -n "${{ env.KUBE_NAMESPACE }}"
+
+      - name: Wait for rollout to complete (5 min timeout)
+        run: |
+          kubectl rollout status deployment/afropay-api \
+            -n "${{ env.KUBE_NAMESPACE }}" --timeout=300s
+
+          kubectl rollout status deployment/afropay-frontend \
+            -n "${{ env.KUBE_NAMESPACE }}" --timeout=300s
+
+      - name: Health check — wait for API /health to respond
+        id: health
+        run: |
+          BASE_URL="${{ vars.STAGING_API_URL }}"
+          echo "Polling ${BASE_URL}/health ..."
+          for i in $(seq 1 24); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 5 "${BASE_URL}/health" || echo "000")
+            echo "  attempt ${i}/24 → HTTP ${STATUS}"
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ /health returned 200"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "❌ /health did not return 200 within 2 minutes"
+          exit 1
+
+      - name: Rollback on health check failure
+        if: failure() && steps.health.outcome == 'failure'
+        run: |
+          echo "⚠️  Health check failed — rolling back deployments"
+          kubectl rollout undo deployment/afropay-api \
+            -n "${{ env.KUBE_NAMESPACE }}"
+          kubectl rollout undo deployment/afropay-frontend \
+            -n "${{ env.KUBE_NAMESPACE }}"
+          kubectl rollout status deployment/afropay-api \
+            -n "${{ env.KUBE_NAMESPACE }}" --timeout=120s
+          kubectl rollout status deployment/afropay-frontend \
+            -n "${{ env.KUBE_NAMESPACE }}" --timeout=120s
+          echo "Rollback complete"
+          exit 1
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 3 — k6 smoke test gate
+  # Deployment is blocked (and automatically rolled back) if tests fail.
+  # ─────────────────────────────────────────────────────────────────────────
+  smoke-test:
+    name: k6 Smoke Test Gate
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    # Always run so we can roll back even when the deploy job is skipped
+    if: success()
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl (for rollback)
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring \
+            --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 \
+            --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] \
+            https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update -q
+          sudo apt-get install -y k6
+
+      - name: Run k6 smoke test
+        id: k6_smoke
+        run: |
+          k6 run \
+            --env BASE_URL="${{ vars.STAGING_API_URL }}" \
+            --env SMOKE_VUS=5 \
+            --env SMOKE_DURATION=1m \
+            --out json=load-tests/results/smoke-staging.json \
+            load-tests/scenarios/smoke.js
+        # k6 exits non-zero when a threshold is breached → job fails
+
+      - name: Upload k6 results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-smoke-staging-${{ github.sha }}
+          path: load-tests/results/smoke-staging.json
+          retention-days: 14
+
+      - name: Rollback on smoke test failure
+        if: failure() && steps.k6_smoke.outcome == 'failure'
+        run: |
+          echo "⚠️  Smoke test failed — rolling back staging deployments"
+          kubectl rollout undo deployment/afropay-api \
+            -n "${{ env.KUBE_NAMESPACE }}"
+          kubectl rollout undo deployment/afropay-frontend \
+            -n "${{ env.KUBE_NAMESPACE }}"
+          kubectl rollout status deployment/afropay-api \
+            -n "${{ env.KUBE_NAMESPACE }}" --timeout=120s
+          kubectl rollout status deployment/afropay-frontend \
+            -n "${{ env.KUBE_NAMESPACE }}" --timeout=120s
+          echo "✅ Rollback complete"
+          exit 1
+
+      - name: Tag images as staging-stable
+        if: success()
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Retag images as staging-stable
+        if: success()
+        run: |
+          IMAGE_TAG="${{ needs.build-and-push.outputs.image_tag }}"
+          # Pull, retag, push using crane (pre-installed on ubuntu-latest)
+          docker pull "${{ env.IMAGE_API }}:${IMAGE_TAG}"
+          docker tag  "${{ env.IMAGE_API }}:${IMAGE_TAG}" \
+                      "${{ env.IMAGE_API }}:staging-stable"
+          docker push "${{ env.IMAGE_API }}:staging-stable"
+
+          docker pull "${{ env.IMAGE_FRONTEND }}:${IMAGE_TAG}"
+          docker tag  "${{ env.IMAGE_FRONTEND }}:${IMAGE_TAG}" \
+                      "${{ env.IMAGE_FRONTEND }}:staging-stable"
+          docker push "${{ env.IMAGE_FRONTEND }}:staging-stable"
+          echo "✅ Images tagged as staging-stable"
