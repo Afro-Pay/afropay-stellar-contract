@@ -1,0 +1,48 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CODEOWNERS — AfroPay
+#
+# Rules are evaluated last-match-wins (bottom of file takes precedence).
+# Patterns follow .gitignore syntax; see:
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# To enforce reviews, configure branch protection on main/develop:
+#   Settings → Branches → Require review from Code Owners
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Default owners for everything not matched by a more specific rule.
+# Replace with your actual team handle or GitHub usernames.
+*                               @afropay/core-team
+
+# ─── Smart contracts ─────────────────────────────────────────────────────────
+# Any change to Soroban contracts requires review from the contracts team.
+# This covers the legacy root-level contract source as well as the workspace.
+/contracts/                     @afropay/contracts-team
+/src/contract.rs                @afropay/contracts-team
+/src/escrow.rs                  @afropay/contracts-team
+/src/oracle.rs                  @afropay/contracts-team
+/src/errors.rs                  @afropay/contracts-team
+/src/events.rs                  @afropay/contracts-team
+/src/migration.rs               @afropay/contracts-team
+
+# ─── Database migrations ─────────────────────────────────────────────────────
+# Migrations are irreversible in production — require DBA + backend lead review.
+/db/migrations/                 @afropay/dba-team @afropay/backend-leads
+/api/migrations/                @afropay/dba-team @afropay/backend-leads
+
+# ─── CI/CD pipelines ─────────────────────────────────────────────────────────
+# Workflow changes can alter the entire delivery pipeline — require devops review.
+/.github/workflows/             @afropay/devops-team @afropay/core-team
+/.github/CODEOWNERS             @afropay/devops-team @afropay/core-team
+
+# ─── Security-sensitive code ─────────────────────────────────────────────────
+/api/services/crypto.ts         @afropay/security-team @afropay/backend-leads
+/api/middleware/sep10.ts        @afropay/security-team @afropay/backend-leads
+/api/routes/sep10.ts            @afropay/security-team @afropay/backend-leads
+/infrastructure/vault/          @afropay/security-team @afropay/devops-team
+
+# ─── Load tests & smoke profiles ─────────────────────────────────────────────
+# Changes to thresholds or smoke test profiles affect the CI gate.
+/load-tests/                    @afropay/devops-team @afropay/core-team
+
+# ─── Documentation (operations) ──────────────────────────────────────────────
+/docs/operations/               @afropay/devops-team

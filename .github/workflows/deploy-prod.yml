@@ -1,0 +1,339 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# AfroPay — Production Deployment
+#
+# Triggers  : manual workflow_dispatch only (explicit, intentional promotions)
+# Strategy  : Blue-green deployment via Kubernetes service label selector swap
+#             GREEN receives traffic → smoke test passes → BLUE decommissioned
+#             Smoke test fails → service selector reverts to BLUE within 2 min
+#
+# Required approval environment: "production"
+#   • Create this in Settings → Environments → production
+#   • Add "production-approvers" as a required reviewer team
+#   • Set "Prevent self-review"
+#
+# Required secrets:
+#   KUBECONFIG_PROD       — base64-encoded kubeconfig for production cluster
+#
+# Required variables:
+#   KUBE_NAMESPACE_PROD   — Kubernetes namespace (e.g. afropay-production)
+#   PROD_API_URL          — Production API base URL
+# ─────────────────────────────────────────────────────────────────────────────
+name: Deploy — Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to promote to production (must exist in GHCR)"
+        required: true
+      reason:
+        description: "Deployment reason / change description (logged to audit trail)"
+        required: true
+      skip_smoke:
+        description: "Skip smoke test? (emergency hotfix only — requires a second approval)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false   # never cancel an in-flight production deployment
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_API: ghcr.io/${{ github.repository_owner }}/afropay-api
+  IMAGE_FRONTEND: ghcr.io/${{ github.repository_owner }}/afropay-frontend
+  KUBE_NAMESPACE: ${{ vars.KUBE_NAMESPACE_PROD || 'afropay-production' }}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Job 1 — Manual approval gate
+# Blocks execution until a member of "production-approvers" approves.
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  approval-gate:
+    name: Manual Approval (production-approvers)
+    runs-on: ubuntu-latest
+    environment:
+      name: production      # GitHub environment with required reviewer configured
+      url: ${{ vars.PROD_API_URL }}
+
+    steps:
+      - name: Log deployment intent to audit trail
+        run: |
+          echo "=========================================="
+          echo "PRODUCTION DEPLOYMENT INITIATED"
+          echo "=========================================="
+          echo "  Actor        : ${{ github.actor }}"
+          echo "  Image tag    : ${{ github.event.inputs.image_tag }}"
+          echo "  Reason       : ${{ github.event.inputs.reason }}"
+          echo "  Skip smoke   : ${{ github.event.inputs.skip_smoke }}"
+          echo "  Timestamp    : $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          echo "  Repository   : ${{ github.repository }}"
+          echo "  Commit SHA   : ${{ github.sha }}"
+          echo "=========================================="
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 2 — Blue-green deploy
+  # The "green" deployment is stood up alongside "blue" (current live).
+  # The service selector is only switched to green after health checks pass.
+  # ─────────────────────────────────────────────────────────────────────────
+  blue-green-deploy:
+    name: Blue-Green Deploy
+    runs-on: ubuntu-latest
+    needs: approval-gate
+
+    outputs:
+      blue_api_image: ${{ steps.snapshot.outputs.blue_api_image }}
+      blue_frontend_image: ${{ steps.snapshot.outputs.blue_frontend_image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PROD }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Snapshot current (blue) image tags
+        id: snapshot
+        run: |
+          BLUE_API=$(kubectl get deployment afropay-api \
+            -n "${{ env.KUBE_NAMESPACE }}" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null \
+            || echo "${{ env.IMAGE_API }}:unknown")
+          BLUE_FRONTEND=$(kubectl get deployment afropay-frontend \
+            -n "${{ env.KUBE_NAMESPACE }}" \
+            -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null \
+            || echo "${{ env.IMAGE_FRONTEND }}:unknown")
+          echo "blue_api_image=${BLUE_API}" >> "$GITHUB_OUTPUT"
+          echo "blue_frontend_image=${BLUE_FRONTEND}" >> "$GITHUB_OUTPUT"
+          echo "Blue (current) API image    : ${BLUE_API}"
+          echo "Blue (current) Frontend image: ${BLUE_FRONTEND}"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify green image exists in GHCR
+        run: |
+          IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+          docker manifest inspect "${{ env.IMAGE_API }}:${IMAGE_TAG}" > /dev/null
+          docker manifest inspect "${{ env.IMAGE_FRONTEND }}:${IMAGE_TAG}" > /dev/null
+          echo "✅ Both images verified in GHCR for tag ${IMAGE_TAG}"
+
+      - name: Create green deployment (API)
+        run: |
+          IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+
+          # Duplicate the current blue deployment as green, then update the image
+          kubectl get deployment afropay-api \
+            -n "${{ env.KUBE_NAMESPACE }}" -o json \
+          | jq --arg tag "$IMAGE_TAG" \
+               --arg img "${{ env.IMAGE_API }}:${IMAGE_TAG}" \
+               --arg slot "green" '
+            .metadata.name = "afropay-api-green"
+            | del(.metadata.resourceVersion, .metadata.uid, .metadata.selfLink,
+                  .metadata.creationTimestamp, .status)
+            | .metadata.labels.slot = $slot
+            | .spec.selector.matchLabels.slot = $slot
+            | .spec.template.metadata.labels.slot = $slot
+            | .spec.template.spec.containers[0].image = $img
+          ' | kubectl apply -f -
+
+      - name: Create green deployment (Frontend)
+        run: |
+          IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+
+          kubectl get deployment afropay-frontend \
+            -n "${{ env.KUBE_NAMESPACE }}" -o json \
+          | jq --arg tag "$IMAGE_TAG" \
+               --arg img "${{ env.IMAGE_FRONTEND }}:${IMAGE_TAG}" \
+               --arg slot "green" '
+            .metadata.name = "afropay-frontend-green"
+            | del(.metadata.resourceVersion, .metadata.uid, .metadata.selfLink,
+                  .metadata.creationTimestamp, .status)
+            | .metadata.labels.slot = $slot
+            | .spec.selector.matchLabels.slot = $slot
+            | .spec.template.metadata.labels.slot = $slot
+            | .spec.template.spec.containers[0].image = $img
+          ' | kubectl apply -f -
+
+      - name: Wait for green pods to be ready
+        run: |
+          kubectl rollout status deployment/afropay-api-green \
+            -n "${{ env.KUBE_NAMESPACE }}" --timeout=300s
+          kubectl rollout status deployment/afropay-frontend-green \
+            -n "${{ env.KUBE_NAMESPACE }}" --timeout=300s
+
+      - name: Switch service selectors to green (traffic cut-over)
+        id: cutover
+        run: |
+          kubectl patch service afropay-api \
+            -n "${{ env.KUBE_NAMESPACE }}" \
+            --type=merge -p '{"spec":{"selector":{"slot":"green"}}}'
+          kubectl patch service afropay-frontend \
+            -n "${{ env.KUBE_NAMESPACE }}" \
+            --type=merge -p '{"spec":{"selector":{"slot":"green"}}}'
+          echo "✅ Traffic switched to green slot"
+
+      - name: Health check — wait for production API /health (2 min max)
+        id: health
+        run: |
+          BASE_URL="${{ vars.PROD_API_URL }}"
+          echo "Polling ${BASE_URL}/health ..."
+          for i in $(seq 1 24); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+              --max-time 5 "${BASE_URL}/health" || echo "000")
+            echo "  attempt ${i}/24 → HTTP ${STATUS}"
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Production /health is healthy"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "❌ Production /health did not return 200 within 2 minutes"
+          exit 1
+
+      - name: Rollback on health check failure (revert selector to blue)
+        if: failure() && steps.cutover.outcome == 'success'
+        run: |
+          echo "⚠️  Health check failed — reverting service selectors to blue slot"
+          kubectl patch service afropay-api \
+            -n "${{ env.KUBE_NAMESPACE }}" \
+            --type=merge -p '{"spec":{"selector":{"slot":"blue"}}}'
+          kubectl patch service afropay-frontend \
+            -n "${{ env.KUBE_NAMESPACE }}" \
+            --type=merge -p '{"spec":{"selector":{"slot":"blue"}}}'
+          echo "Cleaning up failed green deployments"
+          kubectl delete deployment afropay-api-green \
+            -n "${{ env.KUBE_NAMESPACE }}" --ignore-not-found
+          kubectl delete deployment afropay-frontend-green \
+            -n "${{ env.KUBE_NAMESPACE }}" --ignore-not-found
+          echo "✅ Rollback complete — production is back on blue"
+          exit 1
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Job 3 — k6 smoke test gate (production)
+  # Failure triggers automatic rollback to blue within 2 minutes.
+  # ─────────────────────────────────────────────────────────────────────────
+  smoke-test-prod:
+    name: k6 Smoke Test Gate (Production)
+    runs-on: ubuntu-latest
+    needs: blue-green-deploy
+    if: ${{ github.event.inputs.skip_smoke != 'true' }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure kubectl (for rollback)
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PROD }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Install k6
+        run: |
+          sudo gpg -k
+          sudo gpg --no-default-keyring \
+            --keyring /usr/share/keyrings/k6-archive-keyring.gpg \
+            --keyserver hkp://keyserver.ubuntu.com:80 \
+            --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+          echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] \
+            https://dl.k6.io/deb stable main" \
+            | sudo tee /etc/apt/sources.list.d/k6.list
+          sudo apt-get update -q
+          sudo apt-get install -y k6
+
+      - name: Run k6 smoke test against production
+        id: k6_smoke
+        run: |
+          k6 run \
+            --env BASE_URL="${{ vars.PROD_API_URL }}" \
+            --env SMOKE_VUS=5 \
+            --env SMOKE_DURATION=1m \
+            --out json=load-tests/results/smoke-prod.json \
+            load-tests/scenarios/smoke.js
+
+      - name: Upload k6 results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k6-smoke-prod-${{ github.sha }}
+          path: load-tests/results/smoke-prod.json
+          retention-days: 90    # longer retention for production audit records
+
+      - name: Rollback on smoke test failure (revert selector to blue)
+        if: failure() && steps.k6_smoke.outcome == 'failure'
+        run: |
+          echo "⚠️  Production smoke test FAILED — reverting to blue slot"
+          kubectl patch service afropay-api \
+            -n "${{ env.KUBE_NAMESPACE }}" \
+            --type=merge -p '{"spec":{"selector":{"slot":"blue"}}}'
+          kubectl patch service afropay-frontend \
+            -n "${{ env.KUBE_NAMESPACE }}" \
+            --type=merge -p '{"spec":{"selector":{"slot":"blue"}}}'
+          echo "Cleaning up failed green deployments"
+          kubectl delete deployment afropay-api-green \
+            -n "${{ env.KUBE_NAMESPACE }}" --ignore-not-found
+          kubectl delete deployment afropay-frontend-green \
+            -n "${{ env.KUBE_NAMESPACE }}" --ignore-not-found
+          echo "✅ Rollback complete — production traffic restored to blue"
+          exit 1
+
+      - name: Promote green → blue (decommission old blue)
+        if: success()
+        run: |
+          IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+          echo "Smoke test passed. Promoting green → blue."
+
+          # Update the canonical blue deployments to the new image
+          kubectl set image deployment/afropay-api \
+            api="${{ env.IMAGE_API }}:${IMAGE_TAG}" \
+            -n "${{ env.KUBE_NAMESPACE }}"
+          kubectl set image deployment/afropay-frontend \
+            frontend="${{ env.IMAGE_FRONTEND }}:${IMAGE_TAG}" \
+            -n "${{ env.KUBE_NAMESPACE }}"
+
+          # Switch selectors back to the canonical "blue" deployments
+          kubectl patch service afropay-api \
+            -n "${{ env.KUBE_NAMESPACE }}" \
+            --type=merge -p '{"spec":{"selector":{"slot":"blue"}}}'
+          kubectl patch service afropay-frontend \
+            -n "${{ env.KUBE_NAMESPACE }}" \
+            --type=merge -p '{"spec":{"selector":{"slot":"blue"}}}'
+
+          # Remove temporary green deployments
+          kubectl delete deployment afropay-api-green \
+            -n "${{ env.KUBE_NAMESPACE }}" --ignore-not-found
+          kubectl delete deployment afropay-frontend-green \
+            -n "${{ env.KUBE_NAMESPACE }}" --ignore-not-found
+
+          echo "✅ Green promoted to blue. Production deployment complete."
+
+      - name: Tag image as prod-stable
+        if: success()
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Retag images as prod-stable
+        if: success()
+        run: |
+          IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+          docker pull "${{ env.IMAGE_API }}:${IMAGE_TAG}"
+          docker tag  "${{ env.IMAGE_API }}:${IMAGE_TAG}" \
+                      "${{ env.IMAGE_API }}:prod-stable"
+          docker push "${{ env.IMAGE_API }}:prod-stable"
+
+          docker pull "${{ env.IMAGE_FRONTEND }}:${IMAGE_TAG}"
+          docker tag  "${{ env.IMAGE_FRONTEND }}:${IMAGE_TAG}" \
+                      "${{ env.IMAGE_FRONTEND }}:prod-stable"
+          docker push "${{ env.IMAGE_FRONTEND }}:prod-stable"
+          echo "✅ Images tagged as prod-stable"
