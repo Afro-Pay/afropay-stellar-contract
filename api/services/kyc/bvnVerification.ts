@@ -21,6 +21,8 @@
 
 import { BvnProvider, BvnLookupResult, VerificationTier } from "./providers/types";
 import { ProviderError } from "./errors";
+import { escrowEventStore, KycOutcome } from "../eventStore";
+import { EscrowState } from "../../routes/escrow";
 
 // ---------------------------------------------------------------------------
 // Minimal Redis client interface (ioredis / node-redis v4 compatible)
@@ -76,10 +78,25 @@ export class BvnVerificationService {
     }
 
     // 2. Cache miss — call provider.
-    const result = await this.provider.verify(bvn, stellarAccount);
+    let result: BvnLookupResult;
+    try {
+      result = await this.provider.verify(bvn, stellarAccount);
+    } catch (err) {
+      // Write a provider_error audit event before re-throwing.
+      this.appendAuditEvent(stellarAccount, "provider_error", null);
+      throw err;
+    }
 
-    // 3. Write to cache (fire-and-forget; a write failure must not block
-    //    the caller from receiving the verified result).
+    // 3. Determine audit outcome from resolved tier.
+    const outcome: KycOutcome =
+      result.tier === "enhanced" || result.tier === "basic"
+        ? "verified"
+        : "unverified";
+
+    // 4. Write audit trail (fire-and-forget — must not block the caller).
+    this.appendAuditEvent(stellarAccount, outcome, result.providerReference);
+
+    // 5. Write to cache (fire-and-forget).
     this.writeCache(stellarAccount, result).catch((err: unknown) => {
       console.error(
         `[kyc] Failed to cache verification result for ${stellarAccount}: ` +
@@ -147,6 +164,37 @@ export class BvnVerificationService {
       "EX",
       this.ttlSeconds
     );
+  }
+
+  /**
+   * Append a kyc_verification_attempt event to the audit trail.
+   * Uses the stellarAccount as the escrowId key so the event is
+   * queryable per-account in the event store.
+   */
+  private appendAuditEvent(
+    stellarAccount: string,
+    outcome: KycOutcome,
+    providerReference: string | null
+  ): void {
+    try {
+      escrowEventStore.append(stellarAccount, {
+        type: "kyc_verification_attempt",
+        // state/corridor/amountUsdc are required by EscrowEvent but not
+        // meaningful for KYC events — use sentinel values.
+        state: "Funded" as EscrowState,
+        corridor: "",
+        amountUsdc: "",
+        actor: stellarAccount,
+        kycOutcome: outcome,
+        kycProviderReference: providerReference,
+      });
+    } catch (err) {
+      // Audit trail failure must never block the verification response.
+      console.error(
+        `[kyc] Failed to append audit event for ${stellarAccount}: ` +
+        `${err instanceof Error ? err.message : String(err)}`
+      );
+    }
   }
 }
 

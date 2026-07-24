@@ -14,7 +14,10 @@
 import { EventEmitter } from "events";
 import { EscrowState } from "../routes/escrow";
 
-export type EscrowEventType = "created" | "state_changed";
+export type EscrowEventType = "created" | "state_changed" | "kyc_verification_attempt";
+
+/** Outcome values for kyc_verification_attempt events. */
+export type KycOutcome = "verified" | "unverified" | "pending" | "provider_error";
 
 export interface EscrowEvent {
   /** Store-wide monotonically increasing id — used verbatim as the SSE id. */
@@ -25,6 +28,12 @@ export interface EscrowEvent {
   corridor: string;
   amountUsdc: string;
   occurredAt: string;
+  /** Present on kyc_verification_attempt events — Stellar account that triggered the check. */
+  actor?: string;
+  /** Present on kyc_verification_attempt events — outcome of the verification attempt. */
+  kycOutcome?: KycOutcome;
+  /** Present on kyc_verification_attempt events — provider reference ID, if available. */
+  kycProviderReference?: string | null;
 }
 
 function channelFor(escrowId: string): string {
