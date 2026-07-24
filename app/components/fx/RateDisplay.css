@@ -1,0 +1,40 @@
+.rate-display {
+  font-family: inherit;
+}
+
+.rate-display__stale-banner {
+  background: #fff3cd;
+  border: 1px solid #ffc107;
+  border-radius: 4px;
+  color: #856404;
+  font-size: 0.875rem;
+  margin-bottom: 0.5rem;
+  padding: 0.5rem 0.75rem;
+}
+
+.rate-display__error {
+  color: #dc3545;
+  font-size: 0.875rem;
+}
+
+.rate-display__loading {
+  color: #6c757d;
+  font-size: 0.875rem;
+}
+
+.rate-display__value {
+  align-items: baseline;
+  display: flex;
+  gap: 0.5rem;
+}
+
+.rate-display__corridor {
+  color: #6c757d;
+  font-size: 0.875rem;
+}
+
+.rate-display__rate {
+  color: #212529;
+  font-size: 1.25rem;
+  font-weight: 600;
+}
