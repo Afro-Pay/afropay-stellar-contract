@@ -52,7 +52,13 @@ jobs:
           cd contracts/escrow
           PROPTEST_CASES=100000 cargo test --features testutils -- --nocapture
 
-      - name: Run upgrade simulation tests
+      - name: Run upgrade simulation tests (regression harness — Issue #29)
+        # Seeds all 5 escrow states (Pending/Funded/Disputed/Released/Refunded),
+        # calls migrate(), and asserts every record's state, amount, and parties
+        # are intact.  Also verifies post-migration operations and terminal-state
+        # guards.  A broken migrate() function will cause this step to fail with
+        # a descriptive assertion error.
         run: |
           cd contracts/escrow
           cargo test --features testutils upgrade -- --nocapture
+        timeout-minutes: 5
