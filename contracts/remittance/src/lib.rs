@@ -4,6 +4,9 @@ mod fees;
 use soroban_sdk::{contract, contracttype, Address, Env, panic_with_error};
 use fees::{FeeConfig, FeeError, calculate_recipient_amount, calculate_all_fees};
 
+#[cfg(test)]
+mod reentrancy_tests;
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct RemittanceContract;
@@ -11,6 +14,10 @@ pub struct RemittanceContract;
 #[contractimpl]
 impl RemittanceContract {
     /// Calculate the recipient amount for a remittance.
+    ///
+    /// This function is stateless and contains no external calls, therefore
+    /// no reentrancy guards are required. See docs/security/reentrancy-call-graph.md
+    /// for architecture details.
     ///
     /// # Arguments
     /// * `amount` - The amount to send

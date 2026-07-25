@@ -4,6 +4,9 @@ use soroban_sdk::{contract, contracttype, Address, Env, Map, Vec, String, panic}
 pub mod migration;
 use migration::{EscrowMigrationError, migrate as run_migrate};
 
+#[cfg(test)]
+mod reentrancy_tests;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EscrowState {
@@ -90,19 +93,55 @@ impl EscrowContract {
     }
 
     /// Release funds to beneficiary (Funded -> Released)
+    ///
+    /// Implements checks-effects-interactions pattern with reentrancy guard.
+    /// Guard prevents logical reentrancy if external contract calls back before
+    /// state is persisted.
     pub fn release_escrow(env: Env, id: String, beneficiary: Address) {
+        let guard_key = soroban_sdk::Symbol::new(&env, &format!("reentrancy_guard_{}", id));
+
+        // CHECK: Guard is not set (reentrancy detection)
+        if env.storage().instance().has(&guard_key) {
+            panic!("Reentrancy detected: release_escrow already in progress for this escrow");
+        }
+
+        // SET: Reentrancy guard
+        env.storage().instance().set(&guard_key, &true);
+
+        // Fetch and validate escrow
         let mut escrow = Self::get_escrow(env.clone(), id.clone());
         Self::validate_transition(&escrow.state, EscrowState::Released);
         if escrow.beneficiary != beneficiary {
             panic!("Only beneficiary can release funds");
         }
+
+        // EFFECTS: Update state atomically before external calls
         escrow.state = EscrowState::Released;
         escrow.released_at = Some(env.ledger().timestamp());
         env.storage().set(&id, &escrow);
+
+        // INTERACTIONS: External calls happen after state update
+        // (When token transfers are implemented, they go here)
+        // env.invoke_contract(&token_contract, &transfer_fn, args);
+
+        // CLEANUP: Remove guard
+        env.storage().instance().remove(&guard_key);
     }
 
     /// Refund funds to sender (Funded -> Refunded)
+    ///
+    /// Implements checks-effects-interactions pattern with reentrancy guard.
     pub fn refund_escrow(env: Env, id: String, sender: Address) {
+        let guard_key = soroban_sdk::Symbol::new(&env, &format!("reentrancy_guard_{}", id));
+
+        // CHECK: Guard is not set
+        if env.storage().instance().has(&guard_key) {
+            panic!("Reentrancy detected: refund_escrow already in progress for this escrow");
+        }
+
+        // SET: Reentrancy guard
+        env.storage().instance().set(&guard_key, &true);
+
         let mut escrow = Self::get_escrow(env.clone(), id.clone());
         Self::validate_transition(&escrow.state, EscrowState::Refunded);
         if escrow.sender != sender {
@@ -113,12 +152,23 @@ impl EscrowContract {
         if current_time < timelock_time {
             panic!("Timelock not expired");
         }
+
+        // EFFECTS: Update state atomically before external calls
         escrow.state = EscrowState::Refunded;
         escrow.refunded_at = Some(env.ledger().timestamp());
         env.storage().set(&id, &escrow);
+
+        // INTERACTIONS: External calls (token transfers) happen here
+        // env.invoke_contract(&token_contract, &transfer_fn, args);
+
+        // CLEANUP: Remove guard
+        env.storage().instance().remove(&guard_key);
     }
 
     /// Dispute the escrow (Funded -> Disputed)
+    ///
+    /// State machine transition only, no external calls. Protected against concurrent
+    /// operations by state invariant: can only dispute Funded escrows.
     pub fn dispute_escrow(env: Env, id: String, caller: Address) {
         let mut escrow = Self::get_escrow(env.clone(), id.clone());
         Self::validate_transition(&escrow.state, EscrowState::Disputed);
@@ -131,6 +181,9 @@ impl EscrowContract {
     }
 
     /// Resolve dispute (Disputed -> Resolved)
+    ///
+    /// Only arbitrator can resolve. State machine invariant prevents re-entry:
+    /// can only resolve if currently Disputed.
     pub fn resolve_dispute(env: Env, id: String, arbitrator: Address, _release_to_beneficiary: bool) {
         let mut escrow = Self::get_escrow(env.clone(), id.clone());
         Self::validate_transition(&escrow.state, EscrowState::Resolved);
