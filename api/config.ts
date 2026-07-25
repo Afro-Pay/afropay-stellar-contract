@@ -29,6 +29,19 @@ export interface AnchorConfig {
   masterEncryptionKey: Buffer;
   serverX25519PublicKey: Buffer;
   serverX25519PrivateKey: Buffer;
+  /** Redis connection URL — undefined when Redis is not configured (e.g. local dev) */
+  redisUrl: string | undefined;
+  /**
+   * CBN transfer threshold in NGN above which enhanced KYC is required.
+   * Default: 1 000 000 (₦1,000,000).  Override via TRANSFER_LIMIT_NGN env var.
+   */
+  transferLimitNgn: number;
+  /**
+   * Conservative USDC→NGN exchange rate estimate used by verificationGate
+   * when a live rate feed is unavailable.
+   * Default: 1600.  Override via NGN_RATE_ESTIMATE env var.
+   */
+  ngnRateEstimate: number;
 }
 
 function rewriteOrigin(raw: string, homeDomain: string, scheme: string): URL {
@@ -131,6 +144,9 @@ export function loadConfig(): AnchorConfig {
     masterEncryptionKey,
     serverX25519PublicKey,
     serverX25519PrivateKey,
+    redisUrl: process.env.REDIS_URL,
+    transferLimitNgn: parseInt(process.env.TRANSFER_LIMIT_NGN ?? "1000000", 10),
+    ngnRateEstimate: parseFloat(process.env.NGN_RATE_ESTIMATE ?? "1600"),
   };
 }
 

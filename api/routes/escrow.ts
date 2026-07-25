@@ -9,16 +9,42 @@
  *
  * Sensitive endpoints (/release, /dispute) are gated by the full SEP-10
  * Ed25519 JWT verification middleware (not just the shared-secret variant).
+ *
+ * Payment initiation (POST /) is gated by verificationGate which enforces
+ * CBN KYC requirements for high-value NGN corridor transfers (issue #19).
  */
 
 import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { requireSep10Ed25519 } from "../middleware/sep10";
+import { verificationGate } from "../middleware/verificationGate";
+import { createBvnVerificationService } from "../services/kyc/bvnVerification";
 import {
   paymentSubmissionsTotal,
   escrowStateDurationSeconds,
 } from "../services/metrics";
 import { escrowEventStore, EscrowEvent } from "../services/eventStore";
+
+// ---------------------------------------------------------------------------
+// KYC verification gate — instantiated once at module load.
+// The gate is a no-op (service: null) when REDIS_URL is not set so that
+// local development and CI runs without a Redis instance still work.
+// ---------------------------------------------------------------------------
+const kycRedis = process.env.REDIS_URL
+  ? (() => {
+      // Lazy-require ioredis so it is only resolved when REDIS_URL is present.
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const Redis = require("ioredis") as { new(url: string): import("../services/kyc/bvnVerification").RedisClient };
+      return new Redis(process.env.REDIS_URL);
+    })()
+  : null;
+
+const kycService = kycRedis ? createBvnVerificationService(kycRedis) : null;
+
+const kycGate = verificationGate({
+  service: kycService,
+  thresholdNgn: parseInt(process.env.TRANSFER_LIMIT_NGN ?? "1000000", 10),
+});
 
 /** How often to write an SSE comment so idle proxies don't time out the connection. */
 const SSE_HEARTBEAT_INTERVAL_MS = 15_000;
@@ -46,8 +72,10 @@ function notFound(res: Response): void {
 
 // ---------------------------------------------------------------------------
 // POST /api/v1/escrow — initiate a payment / create escrow
+// KYC gate applied first: rejects high-value NGN payments from unverified
+// senders with 403 before the handler runs (issue #19).
 // ---------------------------------------------------------------------------
-router.post("/", (req: Request, res: Response): void => {
+router.post("/", kycGate, (req: Request, res: Response): void => {
   const { sender_account, corridor, amount_usdc } = req.body ?? {};
 
   if (!sender_account || typeof sender_account !== "string") {
