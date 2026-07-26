@@ -1,0 +1,1985 @@
+openapi: 3.1.0
+
+info:
+  title: AfroPay Anchor API
+  version: "0.1.0"
+  description: |
+    AfroPay Stellar anchor API implementing SEP-1, SEP-10, SEP-12, and SEP-31
+    for trustless cross-border remittances on Stellar.
+
+    ## Authentication
+
+    Most endpoints require a **SEP-10 JWT** obtained from `POST /auth`:
+
+    ```
+    Authorization: Bearer <jwt>
+    ```
+
+    The `/api/v1/escrow/:id/release` and `/api/v1/escrow/:id/dispute` endpoints
+    additionally require the JWT to be signed with an **Ed25519 key** (full
+    SEP-10 Ed25519 verification, not the shared-secret variant).
+
+    Content / tier management endpoints authenticate via the
+    `X-Stellar-Account` header (Stellar G… public key).
+
+    The admin reconciliation endpoint requires a separate admin JWT with
+    `role: "admin"`.
+
+    ## Idempotency
+
+    All mutating endpoints (POST / PUT / PATCH / DELETE) **must** include an
+    `Idempotency-Key` header (UUID v4) so that retries are safe. The server
+    replays the original response for duplicate keys.
+
+  contact:
+    name: AfroPay Engineering
+    email: dev@afropay.io
+    url: https://discord.gg/afropay
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: https://api.afropay.io
+    description: Production
+  - url: http://localhost:8000
+    description: Local development
+
+# ---------------------------------------------------------------------------
+# Security schemes
+# ---------------------------------------------------------------------------
+components:
+  securitySchemes:
+    sep10JWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        JWT obtained from `POST /auth` after completing the SEP-10
+        challenge/response flow. Valid for 24 hours.
+
+    adminJWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Admin JWT with `role: "admin"` claim. Issued out-of-band to
+        operations staff.
+
+    stellarAccount:
+      type: apiKey
+      in: header
+      name: X-Stellar-Account
+      description: >
+        Stellar Ed25519 public key (G… address) of the authenticated creator
+        or fan. Used by content / tier management endpoints.
+
+  # -------------------------------------------------------------------------
+  # Reusable headers
+  # -------------------------------------------------------------------------
+  headers:
+    IdempotencyKey:
+      description: >
+        Client-generated UUID v4. The server stores the response and replays
+        it verbatim on duplicate submissions.
+      required: true
+      schema:
+        type: string
+        format: uuid
+        example: "550e8400-e29b-41d4-a716-446655440000"
+
+  # -------------------------------------------------------------------------
+  # Reusable parameters
+  # -------------------------------------------------------------------------
+  parameters:
+    EscrowId:
+      name: id
+      in: path
+      required: true
+      description: UUID of the escrow record.
+      schema:
+        type: string
+        format: uuid
+        example: "a3bb189e-8bf9-3888-9912-ace4e6543002"
+
+    TransactionId:
+      name: id
+      in: path
+      required: true
+      description: UUID of the SEP-31 transaction.
+      schema:
+        type: string
+        format: uuid
+        example: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+
+    TierId:
+      name: id
+      in: path
+      required: true
+      description: UUID of the content tier.
+      schema:
+        type: string
+        format: uuid
+        example: "d290f1ee-6c54-4b01-90e6-d701748f0851"
+
+  # -------------------------------------------------------------------------
+  # Reusable schemas
+  # -------------------------------------------------------------------------
+  schemas:
+
+    # ── Error ───────────────────────────────────────────────────────────────
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.
+          example: "escrow not found"
+        detail:
+          type: string
+          description: Optional extended detail (admin / server errors only).
+          example: "connection refused: postgres:5432"
+
+    # ── SEP-10 ──────────────────────────────────────────────────────────────
+    Sep10ChallengeResponse:
+      type: object
+      required: [transaction, network_passphrase]
+      properties:
+        transaction:
+          type: string
+          description: Base64-encoded XDR of the unsigned SEP-10 challenge transaction.
+          example: "AAAAAgAAAABz0..."
+        network_passphrase:
+          type: string
+          description: Stellar network passphrase the transaction is valid for.
+          example: "Test SDF Network ; September 2015"
+
+    Sep10TokenRequest:
+      type: object
+      required: [transaction]
+      properties:
+        transaction:
+          type: string
+          description: Base64-encoded XDR of the signed SEP-10 challenge transaction.
+          example: "AAAAAgAAAABz0..."
+
+    Sep10TokenResponse:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+          description: "Signed JWT. Pass as Authorization: Bearer <token>."
+          example: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+
+    # ── SEP-12 / KYC ────────────────────────────────────────────────────────
+    CustomerFieldSpec:
+      type: object
+      required: [type, description]
+      properties:
+        type:
+          type: string
+          example: "string"
+        description:
+          type: string
+          example: "The customer's first name"
+        optional:
+          type: boolean
+          default: false
+        status:
+          type: string
+          enum: [ACCEPTED, PROCESSING, REJECTED, NEEDS_INFO]
+          description: Present on provided_fields response only.
+
+    CustomerNeedsInfoResponse:
+      type: object
+      required: [status, fields]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Present when a customer record exists but is incomplete.
+        status:
+          type: string
+          enum: [NEEDS_INFO]
+        fields:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/CustomerFieldSpec"
+          example:
+            first_name: { type: "string", description: "The customer's first name" }
+            last_name:  { type: "string", description: "The customer's last name" }
+            email_address: { type: "string", description: "The customer's email address" }
+
+    CustomerAcceptedResponse:
+      type: object
+      required: [id, status, provided_fields]
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [ACCEPTED]
+        provided_fields:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/CustomerFieldSpec"
+
+    CustomerPutRequest:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: If supplied, update the existing customer record.
+        account:
+          type: string
+          description: Stellar account G… address (defaults to authenticated account).
+        memo:
+          type: string
+          description: Memo ID if the account is shared.
+        memo_type:
+          type: string
+          enum: [id]
+        type:
+          type: string
+          description: SEP-12 customer type (e.g. sep31-sender, sep31-receiver).
+        first_name:
+          type: string
+          example: "Amara"
+        last_name:
+          type: string
+          example: "Okafor"
+        email_address:
+          type: string
+          format: email
+          example: "amara.okafor@example.com"
+
+    CustomerPutResponse:
+      type: object
+      required: [id]
+      properties:
+        id:
+          type: string
+          format: uuid
+
+    # ── SEP-31 ──────────────────────────────────────────────────────────────
+    Sep31AssetInfo:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        min_amount:
+          type: number
+          format: double
+        max_amount:
+          type: number
+          format: double
+        fee_fixed:
+          type: number
+          format: double
+        fee_percent:
+          type: number
+          format: double
+        sep12:
+          type: object
+          description: SEP-12 types required for sender and receiver.
+        fields:
+          type: object
+
+    Sep31InfoResponse:
+      type: object
+      required: [receive]
+      properties:
+        receive:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/Sep31AssetInfo"
+          example:
+            USDC:
+              enabled: true
+              min_amount: 1
+              max_amount: 1000000
+              fee_fixed: 0.5
+              fee_percent: 0
+
+    Sep31TransactionRequest:
+      type: object
+      required: [asset_code, amount, sender_id, receiver_id]
+      properties:
+        asset_code:
+          type: string
+          example: "USDC"
+        asset_issuer:
+          type: string
+          description: Stellar issuer account. Optional for USDC on testnet.
+          example: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"
+        amount:
+          type: string
+          description: Decimal amount to transfer.
+          example: "100.00"
+        sender_id:
+          type: string
+          format: uuid
+          description: SEP-12 customer ID of the sending party.
+        receiver_id:
+          type: string
+          format: uuid
+          description: SEP-12 customer ID of the receiving party.
+        fields:
+          type: object
+          properties:
+            transaction:
+              type: object
+              properties:
+                receiver_account_number:
+                  type: string
+                  example: "0123456789"
+                receiver_routing_number:
+                  type: string
+                  example: "044151003"
+
+    Sep31TransactionCreatedResponse:
+      type: object
+      required: [id, stellar_account_id, stellar_memo_type, stellar_memo]
+      properties:
+        id:
+          type: string
+          format: uuid
+        stellar_account_id:
+          type: string
+          example: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+        stellar_memo_type:
+          type: string
+          example: "hash"
+        stellar_memo:
+          type: string
+          example: "yVtBlS1iqk8Qp/A1qKMEb0i+Xs+xr4tqIv2BaoPT8QM="
+
+    Sep31Transaction:
+      type: object
+      required:
+        - id
+        - status
+        - amount_in
+        - amount_in_asset
+        - amount_out
+        - amount_out_asset
+        - amount_fee
+        - amount_fee_asset
+        - stellar_account_id
+        - stellar_memo_type
+        - stellar_memo
+        - started_at
+        - updated_at
+        - refunded
+      properties:
+        id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum:
+            - pending_sender
+            - pending_stellar
+            - pending_transaction_info_update
+            - pending_receiver
+            - pending_external
+            - completed
+            - error
+          example: "pending_sender"
+        status_eta:
+          type: integer
+          nullable: true
+          description: Estimated seconds until next status change.
+        status_message:
+          type: string
+          nullable: true
+        amount_in:
+          type: string
+          example: "100.00"
+        amount_in_asset:
+          type: string
+          example: "stellar:USDC"
+        amount_out:
+          type: string
+          example: "99.50"
+        amount_out_asset:
+          type: string
+          example: "stellar:USDC"
+        amount_fee:
+          type: string
+          example: "0.50"
+        amount_fee_asset:
+          type: string
+          example: "stellar:USDC"
+        stellar_account_id:
+          type: string
+        stellar_memo_type:
+          type: string
+        stellar_memo:
+          type: string
+        started_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        stellar_transaction_id:
+          type: string
+          nullable: true
+        external_transaction_id:
+          type: string
+          nullable: true
+        refunded:
+          type: boolean
+        required_info_message:
+          type: string
+          nullable: true
+        required_info_updates:
+          type: object
+          nullable: true
+
+    Sep31PatchRequest:
+      type: object
+      required: [fields]
+      properties:
+        fields:
+          type: object
+          required: [transaction]
+          properties:
+            transaction:
+              type: object
+              additionalProperties:
+                type: string
+              example:
+                receiver_account_number: "0987654321"
+
+    Sep31CallbackRequest:
+      type: object
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          example: "https://sending-anchor.example.com/callbacks/sep31"
+
+    # ── Escrow ──────────────────────────────────────────────────────────────
+    EscrowState:
+      type: string
+      enum: [Funded, Released, Refundable, Refunded, Cancelled]
+      description: Current state of the escrow in the state machine.
+
+    EscrowRecord:
+      type: object
+      required:
+        - escrow_id
+        - state
+        - corridor
+        - amount_usdc
+        - created_at
+        - state_changed_at
+      properties:
+        escrow_id:
+          type: string
+          format: uuid
+        state:
+          $ref: "#/components/schemas/EscrowState"
+        corridor:
+          type: string
+          example: "USD_NGN"
+        amount_usdc:
+          type: string
+          description: Decimal USDC amount with 7 decimal places.
+          example: "100.0000000"
+        created_at:
+          type: string
+          format: date-time
+        state_changed_at:
+          type: string
+          format: date-time
+
+    EscrowCreateRequest:
+      type: object
+      required: [sender_account, corridor, amount_usdc]
+      properties:
+        sender_account:
+          type: string
+          description: Stellar G… address of the sender.
+          example: "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+        corridor:
+          type: string
+          description: Currency corridor code (e.g. USD_NGN, EUR_GHS, GBP_KES).
+          example: "USD_NGN"
+        amount_usdc:
+          type: number
+          format: double
+          description: Positive USDC amount to lock in escrow.
+          example: 100.0
+
+    EscrowCreateResponse:
+      type: object
+      required: [escrow_id, state]
+      properties:
+        escrow_id:
+          type: string
+          format: uuid
+        state:
+          $ref: "#/components/schemas/EscrowState"
+
+    EscrowStateResponse:
+      type: object
+      required: [escrow_id, state]
+      properties:
+        escrow_id:
+          type: string
+          format: uuid
+        state:
+          $ref: "#/components/schemas/EscrowState"
+
+    EscrowEvent:
+      type: object
+      description: Server-Sent Event payload for real-time escrow timeline streaming.
+      required: [escrow_id, type, state, occurred_at]
+      properties:
+        escrow_id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          enum: [created, state_changed]
+        state:
+          $ref: "#/components/schemas/EscrowState"
+        corridor:
+          type: string
+          example: "USD_NGN"
+        amount_usdc:
+          type: string
+          example: "100.0000000"
+        occurred_at:
+          type: string
+          format: date-time
+
+    # ── Tiers / Content ─────────────────────────────────────────────────────
+    Tier:
+      type: object
+      required: [id, creatorAccount, name, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        creatorAccount:
+          type: string
+          description: Stellar G… address of the creator.
+          example: "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+        name:
+          type: string
+          example: "Gold Tier"
+        createdAt:
+          type: string
+          format: date-time
+
+    TierCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          example: "Gold Tier"
+
+    TierCreateResponse:
+      type: object
+      required: [tier]
+      properties:
+        tier:
+          $ref: "#/components/schemas/Tier"
+
+    CreatorContent:
+      type: object
+      required: [id, tierId, keyVersion, encryptedContentUrl, iv, authTag, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        tierId:
+          type: string
+          format: uuid
+        keyVersion:
+          type: integer
+          example: 1
+        encryptedContentUrl:
+          type: string
+          description: AES-GCM encrypted content URL (base64).
+        iv:
+          type: string
+          description: AES-GCM initialisation vector (base64).
+        authTag:
+          type: string
+          description: AES-GCM authentication tag (base64).
+        createdAt:
+          type: string
+          format: date-time
+
+    ContentUploadRequest:
+      type: object
+      required: [contentUrl]
+      properties:
+        contentUrl:
+          type: string
+          format: uri
+          example: "https://cdn.afropay.io/content/video-123.mp4"
+
+    ContentUploadResponse:
+      type: object
+      required: [content]
+      properties:
+        content:
+          $ref: "#/components/schemas/CreatorContent"
+
+    TierContentKey:
+      type: object
+      required: [id, tierId, keyVersion, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        tierId:
+          type: string
+          format: uuid
+        keyVersion:
+          type: integer
+          example: 1
+        rotatedAt:
+          type: string
+          format: date-time
+          nullable: true
+        createdAt:
+          type: string
+          format: date-time
+
+    ContentKeyResponse:
+      type: object
+      required: [wrappedKey, keyVersion, serverPublicKey, contents]
+      properties:
+        wrappedKey:
+          type: string
+          description: >
+            AES content key wrapped with the fan's X25519 public key via ECDH
+            key agreement (base64-encoded).
+        keyVersion:
+          type: integer
+          example: 1
+        serverPublicKey:
+          type: string
+          description: Server X25519 ephemeral public key (base64) needed to unwrap.
+        contents:
+          type: array
+          items:
+            $ref: "#/components/schemas/CreatorContent"
+
+    RotateKeyResponse:
+      type: object
+      required: [newKeyVersion]
+      properties:
+        newKeyVersion:
+          type: integer
+          example: 2
+
+    Pass:
+      type: object
+      required: [id, fanAccount, tierId, active, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        fanAccount:
+          type: string
+          description: Stellar G… address of the fan.
+        tierId:
+          type: string
+          format: uuid
+        active:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+
+    PassCreateRequest:
+      type: object
+      required: [fanAccount, tierId]
+      properties:
+        fanAccount:
+          type: string
+          example: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+        tierId:
+          type: string
+          format: uuid
+
+    PassCreateResponse:
+      type: object
+      required: [pass]
+      properties:
+        pass:
+          $ref: "#/components/schemas/Pass"
+
+    # ── Admin / Reconciliation ───────────────────────────────────────────────
+    Discrepancy:
+      type: object
+      required: [escrow_id, scenario]
+      properties:
+        escrow_id:
+          type: string
+          format: uuid
+        scenario:
+          type: string
+          description: Short code describing the type of discrepancy.
+          example: "db_funded_chain_released"
+        db_state:
+          type: string
+          nullable: true
+          example: "Funded"
+        chain_state:
+          type: string
+          nullable: true
+          example: "Released"
+
+    ReconcileResponse:
+      type: object
+      required:
+        - run_id
+        - triggered_by
+        - total_checked
+        - total_matched
+        - total_discrepancies
+        - total_healed
+        - duration_ms
+        - discrepancies
+      properties:
+        run_id:
+          type: string
+          description: Monotonic run identifier.
+        triggered_by:
+          type: string
+          description: Identity of the operator who triggered the run.
+        total_checked:
+          type: integer
+          example: 1500
+        total_matched:
+          type: integer
+          example: 1498
+        total_discrepancies:
+          type: integer
+          example: 2
+        total_healed:
+          type: integer
+          example: 0
+        duration_ms:
+          type: integer
+          example: 3421
+        discrepancies:
+          type: array
+          items:
+            $ref: "#/components/schemas/Discrepancy"
+
+    # ── Webhooks ─────────────────────────────────────────────────────────────
+    WebhookResponse:
+      type: object
+      required: [received, reference, status]
+      properties:
+        received:
+          type: boolean
+          example: true
+        reference:
+          type: string
+          description: The idempotency reference extracted from the event body.
+          example: "pay_ref_abc123"
+        status:
+          type: string
+          enum: [processed, dlq]
+          description: >
+            `processed` — escrow state was updated.
+            `dlq` — escrow not found, event queued for retry.
+
+    # ── Health ───────────────────────────────────────────────────────────────
+    HealthResponse:
+      type: object
+      required: [status, service, version, horizon, timestamp]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        service:
+          type: string
+          example: "afropay-anchor-api"
+        version:
+          type: string
+          example: "0.1.0"
+        horizon:
+          type: object
+          required: [url, connected, latency_ms]
+          properties:
+            url:
+              type: string
+              format: uri
+            connected:
+              type: boolean
+            latency_ms:
+              type: integer
+              nullable: true
+              example: 42
+        timestamp:
+          type: string
+          format: date-time
+
+  # -------------------------------------------------------------------------
+  # Reusable responses
+  # -------------------------------------------------------------------------
+  responses:
+    400BadRequest:
+      description: Bad request — missing or invalid input.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: "sender_account is required"
+
+    401Unauthorized:
+      description: Missing or invalid authentication token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: "Unauthorized"
+
+    403Forbidden:
+      description: Authenticated but not permitted to access the resource.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: "account does not match the authenticated account"
+
+    404NotFound:
+      description: Resource not found.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: "escrow not found"
+
+    409Conflict:
+      description: Conflict with current resource state.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: "escrow is in state Released, not Funded"
+
+    500InternalError:
+      description: Unexpected server error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: "Internal server error"
+
+    503ServiceUnavailable:
+      description: Service unavailable (e.g. Horizon unreachable).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          example:
+            error: "degraded"
+
+# =============================================================================
+# Paths
+# =============================================================================
+paths:
+
+  # ---------------------------------------------------------------------------
+  # Health / observability
+  # ---------------------------------------------------------------------------
+  /health:
+    get:
+      operationId: getHealth
+      summary: Service health check
+      description: >
+        Returns `200 ok` when the service and Horizon are reachable.
+        Returns `503 degraded` when Horizon is unreachable but the API itself
+        is still running.
+      tags: [Observability]
+      security: []
+      responses:
+        "200":
+          description: Service is healthy.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              example:
+                status: ok
+                service: afropay-anchor-api
+                version: "0.1.0"
+                horizon:
+                  url: "https://horizon-testnet.stellar.org"
+                  connected: true
+                  latency_ms: 38
+                timestamp: "2026-07-26T01:00:00.000Z"
+        "503":
+          description: Service is degraded (Horizon unreachable).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /metrics:
+    get:
+      operationId: getMetrics
+      summary: Prometheus metrics scrape endpoint
+      description: >
+        Exposes Prometheus-format text metrics. Intended for scraping by
+        Prometheus — not for direct client use.
+      tags: [Observability]
+      security: []
+      responses:
+        "200":
+          description: Prometheus text exposition format.
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /.well-known/stellar.toml:
+    get:
+      operationId: getStellarToml
+      summary: SEP-1 stellar.toml
+      description: >
+        Returns the Stellar anchor's `stellar.toml` configuration document
+        (SEP-1). Served as `text/plain` with CORS `*`.
+      tags: [SEP-1]
+      security: []
+      responses:
+        "200":
+          description: stellar.toml document.
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  # ---------------------------------------------------------------------------
+  # SEP-10 — Web Authentication
+  # ---------------------------------------------------------------------------
+  /auth:
+    get:
+      operationId: sep10Challenge
+      summary: SEP-10 — get challenge transaction
+      description: >
+        Returns an unsigned SEP-10 challenge transaction. The client signs
+        the transaction and POSTs it back to obtain a JWT.
+      tags: [SEP-10 Auth]
+      security: []
+      parameters:
+        - name: account
+          in: query
+          required: true
+          description: Stellar G… or M… account requesting authentication.
+          schema:
+            type: string
+            example: "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+        - name: memo
+          in: query
+          required: false
+          description: >
+            64-bit integer memo (type id). Required when the account is a
+            shared custodial wallet. Must not be used with muxed (M…) accounts.
+          schema:
+            type: string
+            pattern: "^\\d{1,20}$"
+            example: "1234567890"
+        - name: home_domain
+          in: query
+          required: false
+          description: Must match the server's configured home domain.
+          schema:
+            type: string
+            example: "api.afropay.io"
+        - name: client_domain
+          in: query
+          required: false
+          description: Client domain (not supported — returns 400 if supplied).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Challenge transaction issued successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sep10ChallengeResponse"
+        "400":
+          $ref: "#/components/responses/400BadRequest"
+
+    post:
+      operationId: sep10Token
+      summary: SEP-10 — exchange signed challenge for JWT
+      description: >
+        Verifies the client's signatures on the SEP-10 challenge transaction
+        and returns a signed JWT.
+      tags: [SEP-10 Auth]
+      security: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+          description: UUID v4 idempotency key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Sep10TokenRequest"
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: "#/components/schemas/Sep10TokenRequest"
+      responses:
+        "200":
+          description: JWT issued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sep10TokenResponse"
+        "400":
+          $ref: "#/components/responses/400BadRequest"
+
+  # ---------------------------------------------------------------------------
+  # SEP-12 — KYC
+  # ---------------------------------------------------------------------------
+  /kyc/customer:
+    get:
+      operationId: sep12GetCustomer
+      summary: SEP-12 — get customer KYC status
+      description: >
+        Returns the KYC status for the authenticated account. A `NEEDS_INFO`
+        response lists the fields that must be submitted. An `ACCEPTED` response
+        lists the fields that have been accepted.
+      tags: [SEP-12 KYC]
+      security:
+        - sep10JWT: []
+      parameters:
+        - name: id
+          in: query
+          required: false
+          description: Customer UUID. Falls back to the authenticated account.
+          schema:
+            type: string
+            format: uuid
+        - name: account
+          in: query
+          required: false
+          description: Stellar account address. Defaults to authenticated account.
+          schema:
+            type: string
+        - name: memo
+          in: query
+          required: false
+          description: Memo ID for shared custodial accounts.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Customer status.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/CustomerNeedsInfoResponse"
+                  - $ref: "#/components/schemas/CustomerAcceptedResponse"
+        "403":
+          $ref: "#/components/responses/403Forbidden"
+        "404":
+          $ref: "#/components/responses/404NotFound"
+
+    put:
+      operationId: sep12PutCustomer
+      summary: SEP-12 — create or update customer KYC fields
+      description: >
+        Creates a new customer record or updates an existing one. Accepts
+        both `application/json` and `multipart/form-data` (for future file
+        uploads). Returns the customer UUID.
+      tags: [SEP-12 KYC]
+      security:
+        - sep10JWT: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CustomerPutRequest"
+          multipart/form-data:
+            schema:
+              $ref: "#/components/schemas/CustomerPutRequest"
+      responses:
+        "202":
+          description: Customer accepted / updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CustomerPutResponse"
+        "400":
+          $ref: "#/components/responses/400BadRequest"
+        "403":
+          $ref: "#/components/responses/403Forbidden"
+        "404":
+          $ref: "#/components/responses/404NotFound"
+
+  /kyc/customer/{account}:
+    delete:
+      operationId: sep12DeleteCustomer
+      summary: SEP-12 — delete customer data (right to erasure)
+      description: >
+        Deletes all customer records associated with the given Stellar account.
+        The authenticated account must match the path parameter.
+      tags: [SEP-12 KYC]
+      security:
+        - sep10JWT: []
+      parameters:
+        - name: account
+          in: path
+          required: true
+          description: Stellar G… address whose data should be erased.
+          schema:
+            type: string
+            example: "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Customer data deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                example: {}
+        "403":
+          $ref: "#/components/responses/403Forbidden"
+        "404":
+          $ref: "#/components/responses/404NotFound"
+
+  # ---------------------------------------------------------------------------
+  # SEP-31 — Cross-Border Payments
+  # ---------------------------------------------------------------------------
+  /sep31/info:
+    get:
+      operationId: sep31Info
+      summary: SEP-31 — anchor capabilities and fee schedule
+      description: >
+        Returns the assets supported for cross-border payments, including
+        fee schedule, min/max amounts, and required SEP-12 customer types.
+      tags: [SEP-31 Payments]
+      security: []
+      responses:
+        "200":
+          description: Anchor capability info.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sep31InfoResponse"
+
+  /sep31/transactions:
+    post:
+      operationId: sep31CreateTransaction
+      summary: SEP-31 — initiate a cross-border payment
+      description: >
+        Creates a new SEP-31 transaction. The response includes the Stellar
+        account and memo to which the sending anchor should send funds.
+      tags: [SEP-31 Payments]
+      security:
+        - sep10JWT: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Sep31TransactionRequest"
+            example:
+              asset_code: "USDC"
+              amount: "100.00"
+              sender_id: "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+              receiver_id: "a3bb189e-8bf9-3888-9912-ace4e6543002"
+              fields:
+                transaction:
+                  receiver_account_number: "0123456789"
+      responses:
+        "201":
+          description: Transaction created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Sep31TransactionCreatedResponse"
+        "400":
+          $ref: "#/components/responses/400BadRequest"
+        "401":
+          $ref: "#/components/responses/401Unauthorized"
+
+  /sep31/transactions/{id}:
+    get:
+      operationId: sep31GetTransaction
+      summary: SEP-31 — get transaction status
+      tags: [SEP-31 Payments]
+      security:
+        - sep10JWT: []
+      parameters:
+        - $ref: "#/components/parameters/TransactionId"
+      responses:
+        "200":
+          description: Transaction detail.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [transaction]
+                properties:
+                  transaction:
+                    $ref: "#/components/schemas/Sep31Transaction"
+        "401":
+          $ref: "#/components/responses/401Unauthorized"
+        "404":
+          $ref: "#/components/responses/404NotFound"
+
+    patch:
+      operationId: sep31PatchTransaction
+      summary: SEP-31 — supply missing transaction info
+      description: >
+        Provides the fields previously flagged as required by the anchor. The
+        transaction must be in `pending_transaction_info_update` status.
+      tags: [SEP-31 Payments]
+      security:
+        - sep10JWT: []
+      parameters:
+        - $ref: "#/components/parameters/TransactionId"
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Sep31PatchRequest"
+      responses:
+        "200":
+          description: Transaction updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [transaction]
+                properties:
+                  transaction:
+                    $ref: "#/components/schemas/Sep31Transaction"
+        "400":
+          $ref: "#/components/responses/400BadRequest"
+        "401":
+          $ref: "#/components/responses/401Unauthorized"
+        "404":
+          $ref: "#/components/responses/404NotFound"
+
+  /sep31/transactions/{id}/callback:
+    put:
+      operationId: sep31SetCallback
+      summary: SEP-31 — register a status callback URL
+      description: >
+        Registers a URL that will receive POST notifications when the
+        transaction status changes.
+      tags: [SEP-31 Payments]
+      security:
+        - sep10JWT: []
+      parameters:
+        - $ref: "#/components/parameters/TransactionId"
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Sep31CallbackRequest"
+      responses:
+        "204":
+          description: Callback URL registered.
+        "400":
+          $ref: "#/components/responses/400BadRequest"
+        "401":
+          $ref: "#/components/responses/401Unauthorized"
+        "404":
+          $ref: "#/components/responses/404NotFound"
+
+  # ---------------------------------------------------------------------------
+  # Escrow — payment initiation and lifecycle
+  # ---------------------------------------------------------------------------
+  /api/v1/escrow:
+    post:
+      operationId: createEscrow
+      summary: Create an escrow (initiate payment)
+      description: >
+        Locks USDC in escrow for the specified corridor. Returns an escrow ID
+        and initial `Funded` state. The escrow transitions to `Released`,
+        `Refundable`, or `Cancelled` via subsequent lifecycle endpoints.
+      tags: [Escrow]
+      security: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EscrowCreateRequest"
+            example:
+              sender_account: "GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"
+              corridor: "USD_NGN"
+              amount_usdc: 100.0
+      responses:
+        "201":
+          description: Escrow created in `Funded` state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EscrowCreateResponse"
+              example:
+                escrow_id: "a3bb189e-8bf9-3888-9912-ace4e6543002"
+                state: "Funded"
+        "400":
+          $ref: "#/components/responses/400BadRequest"
+        "500":
+          $ref: "#/components/responses/500InternalError"
+
+  /api/v1/escrow/{id}:
+    get:
+      operationId: getEscrow
+      summary: Get escrow state
+      description: Returns full escrow details including current state and timestamps.
+      tags: [Escrow]
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/EscrowId"
+      responses:
+        "200":
+          description: Escrow record.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EscrowRecord"
+              example:
+                escrow_id: "a3bb189e-8bf9-3888-9912-ace4e6543002"
+                state: "Funded"
+                corridor: "USD_NGN"
+                amount_usdc: "100.0000000"
+                created_at: "2026-07-26T01:00:00.000Z"
+                state_changed_at: "2026-07-26T01:00:00.000Z"
+        "404":
+          $ref: "#/components/responses/404NotFound"
+
+  /api/v1/escrow/{id}/stream:
+    get:
+      operationId: streamEscrowEvents
+      summary: Real-time escrow timeline via Server-Sent Events
+      description: >
+        Opens a persistent SSE stream that emits `escrow_event` events for
+        every state change. The browser's `EventSource` (or the `Last-Event-ID`
+        header / `?lastEventId=` query parameter) is used to resume from the
+        last received event after a reconnect — no event is skipped or
+        double-delivered.
+
+        A `: heartbeat` comment is sent every 15 seconds to keep idle proxies
+        from closing the connection.
+      tags: [Escrow]
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/EscrowId"
+        - name: Last-Event-ID
+          in: header
+          required: false
+          description: >
+            Monotonic event ID from the last successfully received SSE frame.
+            Events after this ID are replayed on reconnect.
+          schema:
+            type: integer
+            example: 5
+        - name: lastEventId
+          in: query
+          required: false
+          description: Fallback for non-browser SSE clients that cannot send the header.
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: SSE stream opened.
+          headers:
+            Content-Type:
+              schema:
+                type: string
+                enum: ["text/event-stream"]
+            Cache-Control:
+              schema:
+                type: string
+                enum: ["no-cache, no-transform"]
+            X-Accel-Buffering:
+              schema:
+                type: string
+                enum: ["no"]
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: >
+                  Each event frame has the form:
+                  ```
+                  id: <monotonic-int>
+                  event: escrow_event
+                  data: <EscrowEvent JSON>
+                  ```
+              example: |
+                id: 1
+                event: escrow_event
+                data: {"escrow_id":"a3bb189e-...","type":"created","state":"Funded","corridor":"USD_NGN","amount_usdc":"100.0000000","occurred_at":"2026-07-26T01:00:00.000Z"}
+        "404":
+          $ref: "#/components/responses/404NotFound"
+
+  /api/v1/escrow/{id}/release:
+    post:
+      operationId: releaseEscrow
+      summary: Release escrow funds to agent (SEP-10 Ed25519)
+      description: >
+        Transitions the escrow from `Funded` to `Released`, releasing USDC to
+        the off-ramp agent. Requires full SEP-10 Ed25519 JWT (not the
+        shared-secret variant).
+      tags: [Escrow]
+      security:
+        - sep10JWT: []
+      parameters:
+        - $ref: "#/components/parameters/EscrowId"
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Escrow released.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EscrowStateResponse"
+              example:
+                escrow_id: "a3bb189e-8bf9-3888-9912-ace4e6543002"
+                state: "Released"
+        "401":
+          $ref: "#/components/responses/401Unauthorized"
+        "404":
+          $ref: "#/components/responses/404NotFound"
+        "409":
+          $ref: "#/components/responses/409Conflict"
+
+  /api/v1/escrow/{id}/dispute:
+    post:
+      operationId: disputeEscrow
+      summary: Open a dispute on an escrow (SEP-10 Ed25519)
+      description: >
+        Transitions the escrow from `Funded` or `Released` to `Refundable`,
+        marking it for manual review. Requires full SEP-10 Ed25519 JWT.
+      tags: [Escrow]
+      security:
+        - sep10JWT: []
+      parameters:
+        - $ref: "#/components/parameters/EscrowId"
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Dispute opened; escrow is now Refundable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EscrowStateResponse"
+              example:
+                escrow_id: "a3bb189e-8bf9-3888-9912-ace4e6543002"
+                state: "Refundable"
+        "401":
+          $ref: "#/components/responses/401Unauthorized"
+        "404":
+          $ref: "#/components/responses/404NotFound"
+        "409":
+          $ref: "#/components/responses/409Conflict"
+
+  # ---------------------------------------------------------------------------
+  # Content Tiers
+  # ---------------------------------------------------------------------------
+  /api/v1/tiers:
+    post:
+      operationId: createTier
+      summary: Create a content tier
+      description: >
+        Creates a new content tier for the authenticated creator, generating
+        an initial AES-256 content key. The key is stored encrypted with the
+        server master key.
+      tags: [Content Tiers]
+      security:
+        - stellarAccount: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TierCreateRequest"
+            example:
+              name: "Gold Tier"
+      responses:
+        "201":
+          description: Tier created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TierCreateResponse"
+        "400":
+          $ref: "#/components/responses/400BadRequest"
+        "401":
+          $ref: "#/components/responses/401Unauthorized"
+        "500":
+          $ref: "#/components/responses/500InternalError"
+
+  /api/v1/tiers/{id}/content:
+    post:
+      operationId: uploadTierContent
+      summary: Upload and encrypt content for a tier
+      description: >
+        Encrypts the given content URL with the tier's current AES-GCM content
+        key and stores the ciphertext. Only the tier's creator may upload.
+      tags: [Content Tiers]
+      security:
+        - stellarAccount: []
+      parameters:
+        - $ref: "#/components/parameters/TierId"
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ContentUploadRequest"
+      responses:
+        "201":
+          description: Content stored (encrypted).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContentUploadResponse"
+        "400":
+          $ref: "#/components/responses/400BadRequest"
+        "401":
+          $ref: "#/components/responses/401Unauthorized"
+        "403":
+          $ref: "#/components/responses/403Forbidden"
+        "404":
+          $ref: "#/components/responses/404NotFound"
+        "500":
+          $ref: "#/components/responses/500InternalError"
+
+  /api/v1/tiers/{id}/content/key:
+    get:
+      operationId: getTierContentKey
+      summary: Get wrapped content key (fans with active pass)
+      description: >
+        Returns the tier's AES content key wrapped for the fan's X25519 public
+        key via ECDH, plus all encrypted content entries for the tier. The fan
+        must hold an active pass.
+      tags: [Content Tiers]
+      security:
+        - stellarAccount: []
+      parameters:
+        - $ref: "#/components/parameters/TierId"
+        - name: fanPublicKey
+          in: query
+          required: true
+          description: >
+            Fan's Ed25519 public key (base64-encoded) used for ECDH key wrapping.
+          schema:
+            type: string
+            example: "abc123base64=="
+      responses:
+        "200":
+          description: Wrapped content key and encrypted contents.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContentKeyResponse"
+        "400":
+          $ref: "#/components/responses/400BadRequest"
+        "401":
+          $ref: "#/components/responses/401Unauthorized"
+        "403":
+          $ref: "#/components/responses/403Forbidden"
+        "404":
+          $ref: "#/components/responses/404NotFound"
+        "500":
+          $ref: "#/components/responses/500InternalError"
+
+  /api/v1/tiers/{id}/content/rotate-key:
+    post:
+      operationId: rotateTierContentKey
+      summary: Rotate content encryption key for a tier
+      description: >
+        Generates a new AES-256 content key, marks the old key as rotated, and
+        stores the new key. Future content uploads use the new key version.
+        Only the tier's creator may rotate keys.
+      tags: [Content Tiers]
+      security:
+        - stellarAccount: []
+      parameters:
+        - $ref: "#/components/parameters/TierId"
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Key rotated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RotateKeyResponse"
+              example:
+                newKeyVersion: 2
+        "401":
+          $ref: "#/components/responses/401Unauthorized"
+        "403":
+          $ref: "#/components/responses/403Forbidden"
+        "404":
+          $ref: "#/components/responses/404NotFound"
+        "500":
+          $ref: "#/components/responses/500InternalError"
+
+  /api/v1/tiers/passes:
+    post:
+      operationId: createPass
+      summary: Create a fan pass for a tier
+      description: >
+        Grants a fan access to a content tier by creating an active pass
+        record. In production this endpoint should be gated behind payment
+        verification; it currently accepts any request (no auth guard).
+      tags: [Content Tiers]
+      security: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PassCreateRequest"
+            example:
+              fanAccount: "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5"
+              tierId: "d290f1ee-6c54-4b01-90e6-d701748f0851"
+      responses:
+        "201":
+          description: Pass created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PassCreateResponse"
+        "400":
+          $ref: "#/components/responses/400BadRequest"
+        "500":
+          $ref: "#/components/responses/500InternalError"
+
+  # ---------------------------------------------------------------------------
+  # Admin — Reconciliation
+  # ---------------------------------------------------------------------------
+  /admin/reconcile:
+    post:
+      operationId: runReconciliation
+      summary: Trigger on-demand reconciliation against the Soroban contract
+      description: >
+        Compares every escrow record in Postgres against the live Soroban
+        contract state. Discrepancies are returned in the response.
+
+        Pass `?heal=true` to automatically apply self-heal updates for each
+        discrepancy found. Only one reconciliation run may execute at a time;
+        a second concurrent request returns `409`.
+      tags: [Admin]
+      security:
+        - adminJWT: []
+      parameters:
+        - name: heal
+          in: query
+          required: false
+          description: >
+            When `true`, apply self-heal DB updates for every discrepancy found.
+          schema:
+            type: boolean
+            default: false
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Reconciliation completed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReconcileResponse"
+              example:
+                run_id: "42"
+                triggered_by: "ops@afropay.io"
+                total_checked: 1500
+                total_matched: 1498
+                total_discrepancies: 2
+                total_healed: 0
+                duration_ms: 3421
+                discrepancies:
+                  - escrow_id: "a3bb189e-8bf9-3888-9912-ace4e6543002"
+                    scenario: "db_funded_chain_released"
+                    db_state: "Funded"
+                    chain_state: "Released"
+        "401":
+          $ref: "#/components/responses/401Unauthorized"
+        "409":
+          description: A reconciliation run is already in progress.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                error: "A reconciliation run is already in progress"
+        "500":
+          $ref: "#/components/responses/500InternalError"
+
+  # ---------------------------------------------------------------------------
+  # Webhooks — payment provider callbacks
+  # ---------------------------------------------------------------------------
+  /webhooks/paystack:
+    post:
+      operationId: paystackWebhook
+      summary: Receive Paystack payment event
+      description: >
+        Receives Paystack webhook events. The `x-paystack-signature` header
+        must be a valid HMAC-SHA256 of the raw request body using the
+        `PAYSTACK_SECRET_KEY`. Duplicate events (same `data.reference`) are
+        detected and the original response is replayed without re-processing.
+      tags: [Webhooks]
+      security: []
+      parameters:
+        - name: x-paystack-signature
+          in: header
+          required: true
+          description: HMAC-SHA256 of the raw body using `PAYSTACK_SECRET_KEY` (hex).
+          schema:
+            type: string
+            example: "3f5e1a..."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [event, data]
+              properties:
+                event:
+                  type: string
+                  example: "charge.success"
+                data:
+                  type: object
+                  required: [reference]
+                  properties:
+                    id:
+                      type: integer
+                    reference:
+                      type: string
+                      example: "pay_ref_abc123"
+                    status:
+                      type: string
+                      enum: [success, failed, abandoned]
+              additionalProperties: true
+      responses:
+        "200":
+          description: Event received and processed (or replayed).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookResponse"
+        "400":
+          description: Invalid signature, missing reference, or malformed JSON.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_signature:
+                  value: { error: "invalid_signature" }
+                missing_reference:
+                  value: { error: "missing_reference" }
+                invalid_json:
+                  value: { error: "invalid_json" }
+
+  /webhooks/flutterwave:
+    post:
+      operationId: flutterwaveWebhook
+      summary: Receive Flutterwave payment event
+      description: >
+        Receives Flutterwave webhook events. The `verif-hash` header must
+        contain a valid HMAC-SHA512 of the raw request body using the
+        `FLW_WEBHOOK_SECRET`. Duplicate events (same `data.tx_ref`) are
+        detected and replayed.
+      tags: [Webhooks]
+      security: []
+      parameters:
+        - name: verif-hash
+          in: header
+          required: true
+          description: HMAC-SHA512 of the raw body using `FLW_WEBHOOK_SECRET` (hex).
+          schema:
+            type: string
+            example: "7e3b29..."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [event, data]
+              properties:
+                event:
+                  type: string
+                  example: "charge.completed"
+                data:
+                  type: object
+                  required: [tx_ref]
+                  properties:
+                    id:
+                      type: integer
+                    tx_ref:
+                      type: string
+                      example: "flw_ref_xyz789"
+                    txRef:
+                      type: string
+                      description: Alias for tx_ref (legacy Flutterwave field).
+                    status:
+                      type: string
+                      enum: [successful, failed, cancelled]
+              additionalProperties: true
+      responses:
+        "200":
+          description: Event received and processed (or replayed).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WebhookResponse"
+        "400":
+          description: Invalid signature, missing reference, or malformed JSON.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalid_signature:
+                  value: { error: "invalid_signature" }
+                missing_reference:
+                  value: { error: "missing_reference" }
+                invalid_json:
+                  value: { error: "invalid_json" }
+
+# =============================================================================
+# Tags
+# =============================================================================
+tags:
+  - name: Observability
+    description: Health checks and Prometheus metrics.
+  - name: SEP-1
+    description: Stellar anchor configuration (stellar.toml).
+  - name: SEP-10 Auth
+    description: Web authentication — SEP-10 challenge / token flow.
+  - name: SEP-12 KYC
+    description: Know Your Customer — SEP-12 customer data management.
+  - name: SEP-31 Payments
+    description: Cross-border payment initiation — SEP-31.
+  - name: Escrow
+    description: Trustless USDC escrow lifecycle (create, stream, release, dispute).
+  - name: Content Tiers
+    description: Encrypted content tiers and fan passes.
+  - name: Admin
+    description: Operator-only endpoints (admin JWT required).
+  - name: Webhooks
+    description: Payment provider callback handlers (Paystack, Flutterwave).
