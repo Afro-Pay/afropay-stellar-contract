@@ -115,6 +115,11 @@ router.post("/transactions", requireSep10, (req: Request, res: Response) => {
   const { asset_code, asset_issuer, amount, sender_id, receiver_id } = body;
   const fields: Record<string, string> = body.fields?.transaction || {};
 
+  // Reject client-supplied fee fields — fee must be server-computed from config.
+  if (body.fee !== undefined || body.feeOverride !== undefined || body.amount_fee !== undefined) {
+    return badRequest(res, { error: "fee field is not accepted; fee is server-computed from anchor configuration" });
+  }
+
   if (!asset_code || typeof asset_code !== "string") {
     return badRequest(res, { error: "asset_code is required" });
   }
