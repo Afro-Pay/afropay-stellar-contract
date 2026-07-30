@@ -1,0 +1,163 @@
+name: API Contract Tests
+
+on:
+  pull_request:
+    paths:
+      - "api/**"
+      - ".github/workflows/api-contract.yml"
+  push:
+    branches: [main]
+    paths:
+      - "api/**"
+      - ".github/workflows/api-contract.yml"
+
+# Cancel in-progress runs for the same branch/PR so a fast-follow push does
+# not queue behind a slower earlier run.
+concurrency:
+  group: api-contract-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-spec:
+    name: Validate OpenAPI spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install openapi-spec-validator
+        run: pip install openapi-spec-validator==0.7.1
+
+      - name: Validate api/openapi.yaml
+        run: openapi-spec-validator api/openapi.yaml
+
+  contract-test:
+    name: Dredd contract tests
+    runs-on: ubuntu-latest
+    needs: validate-spec
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: afropay
+          POSTGRES_PASSWORD: afropay
+          POSTGRES_DB: afropay_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U afropay"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # API server
+      PORT: 8000
+      HOME_DOMAIN: "localhost:8000"
+      NETWORK_PASSPHRASE: "Test SDF Network ; September 2015"
+      HORIZON_URL: "https://horizon-testnet.stellar.org"
+      # Deterministic test keypair — NEVER use in production
+      SEP10_SIGNING_SEED: "SCZANGBA5RLAZ7QSQE7RHKH4APCLKZO4TCT4CDTJHOM7LX7H4UQGPNM"
+      JWT_SECRET: "test-jwt-secret-32-bytes-min-len"
+      DATABASE_URL: "postgresql://afropay:afropay@localhost:5432/afropay_test"
+      # Dummy 32-byte master key (base64)
+      MASTER_ENCRYPTION_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      # Paystack / Flutterwave secrets for webhook signature tests
+      PAYSTACK_SECRET_KEY: "test-paystack-secret"
+      FLW_WEBHOOK_SECRET: "test-flutterwave-secret"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: api/package-lock.json
+
+      - name: Install API dependencies
+        run: npm ci
+        working-directory: api
+
+      - name: Build API
+        run: npm run build
+        working-directory: api
+
+      - name: Run API migrations
+        run: |
+          npm install -g db-migrate db-migrate-pg
+          psql "$DATABASE_URL" -f api/migrations/001_webhook_idempotency.sql || true
+        env:
+          DATABASE_URL: postgresql://afropay:afropay@localhost:5432/afropay_test
+
+      - name: Start API server
+        run: |
+          node dist/server.js &
+          # Wait until the health endpoint returns 200
+          for i in $(seq 1 30); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/health || echo 000)
+            if [ "$STATUS" = "200" ] || [ "$STATUS" = "503" ]; then
+              echo "API ready (HTTP $STATUS)"
+              break
+            fi
+            echo "Waiting for API... attempt $i (HTTP $STATUS)"
+            sleep 2
+          done
+        working-directory: api
+
+      - name: Install Dredd
+        run: npm install -g dredd@14.1.0
+
+      - name: Run Dredd contract tests
+        run: >
+          dredd api/openapi.yaml http://localhost:8000
+          --reporter cli
+          --reporter junit
+          --output dredd-results.xml
+          --hookfiles api/dredd-hooks.js
+          --fail-on-error
+          --color
+
+      - name: Upload Dredd results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dredd-results
+          path: dredd-results.xml
+          retention-days: 14
+
+  redoc-build:
+    name: Build Redoc static docs
+    runs-on: ubuntu-latest
+    needs: validate-spec
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: api/package-lock.json
+
+      - name: Install API dependencies
+        run: npm ci
+        working-directory: api
+
+      - name: Build Redoc static site
+        run: npm run docs:build
+        working-directory: api
+
+      - name: Upload Redoc artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-docs
+          path: api/docs-dist/
+          retention-days: 30

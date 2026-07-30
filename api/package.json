@@ -9,7 +9,11 @@
     "start": "node dist/server.js",
     "dev": "tsc && node dist/server.js",
     "test": "jest --config jest.config.json --runInBand",
-    "test:ci": "jest --config jest.config.json --runInBand --forceExit"
+    "test:ci": "jest --config jest.config.json --runInBand --forceExit",
+    "docs:serve": "npx @redocly/cli preview-docs api/openapi.yaml --port 8080",
+    "docs:build": "npx @redocly/cli build-docs api/openapi.yaml --output docs-dist/index.html",
+    "spec:validate": "openapi-spec-validator api/openapi.yaml",
+    "schema:export": "node scripts/export-json-schemas.js"
   },
   "dependencies": {
     "@iarna/toml": "^2.2.5",
