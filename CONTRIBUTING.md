@@ -297,13 +297,54 @@ For smaller decisions, a brief note in the PR description is sufficient.
 
 ## Threat Model Updates
 
-The threat model lives in `docs/contract-design.md` under the "Security Model" section. Any PR that:
+The threat model lives in [`docs/security/threat-model/`](docs/security/threat-model/) and consists of three documents:
+
+| Document | Contents |
+|----------|---------|
+| [`dfd.md`](docs/security/threat-model/dfd.md) | Mermaid Level-1 Data-Flow Diagram — all trust boundaries |
+| [`stride-analysis.md`](docs/security/threat-model/stride-analysis.md) | STRIDE threat enumeration — severity, mitigations, residual risks |
+| [`README.md`](docs/security/threat-model/README.md) | Review process and update cadence |
+
+### Mandatory Rule
+
+> **PRs that add a new external integration or trust boundary must update the threat model.**
+
+Specifically, a PR **must** update `dfd.md` and `stride-analysis.md` if it:
 
 - Adds a new entry point to `contract.rs` or `contracts/escrow/src/lib.rs`
 - Changes oracle registration or admin auth logic
 - Modifies timeout / refund mechanics
+- Adds a new off-ramp payment provider, webhook source, or rate feed
+- Introduces a new service that communicates across a network boundary
+- Changes SEP-10 authentication or signing key handling
+- Modifies fund transfer logic (`deposit_escrow`, `release_to_agent`, `claim_refund`)
 
-…must include a brief "Threat Model Impact" section in the PR description describing whether the attack surface changes and, if so, what mitigations are in place.
+PRs that meet the above criteria but do not include a threat model update will be labelled **`needs-threat-model-update`** and will not be merged until the update is provided.
+
+### What to Include in the PR Description
+
+Every qualifying PR must include a **"Threat Model Impact"** section:
+
+```
+### Threat Model Impact
+
+- [ ] This PR adds / modifies a trust boundary: [yes / no]
+- [ ] dfd.md updated: [yes / no / not required]
+- [ ] stride-analysis.md updated: [yes / no / not required]
+- Summary of attack-surface changes and mitigations:
+  <describe changes here>
+```
+
+### Approval Requirements for Threat Model Changes
+
+| Change Type | Approvals Required |
+|-------------|-------------------|
+| Typo fix, issue link update | 1 approval |
+| New threat entry or mitigation change | 2 approvals (1 must be a maintainer) |
+| Removing a threat or downgrading severity | 2 maintainer approvals |
+| Accepting a residual risk | 2 maintainer approvals with documented rationale |
+
+See [`docs/security/threat-model/README.md`](docs/security/threat-model/README.md) for the full review process, acceptance criteria, and cadence.
 
 ---
 
