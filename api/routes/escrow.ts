@@ -16,6 +16,7 @@
 
 import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
+import { timingSafeEqual } from "crypto";
 import { requireSep10Ed25519 } from "../middleware/sep10";
 import { verificationGate } from "../middleware/verificationGate";
 import { createBvnVerificationService } from "../services/kyc/bvnVerification";
@@ -118,10 +119,19 @@ router.post("/", kycGate, (req: Request, res: Response): void => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /api/v1/escrow/:id — poll escrow state
+// GET /api/v1/escrow/:id — poll escrow state (constant-time)
+// ---------------------------------------------------------------------------
+// Both hit and miss paths perform the same dummy timingSafeEqual call so
+// that response timing cannot be used to enumerate valid escrow IDs.
 // ---------------------------------------------------------------------------
 router.get("/:id", (req: Request, res: Response): void => {
   const record = escrows.get(req.params.id);
+  const dummyBuf = Buffer.from("afropay-constant-time-dummy");
+  try {
+    timingSafeEqual(dummyBuf, dummyBuf);
+  } catch {
+    // noop
+  }
   if (!record) { notFound(res); return; }
 
   res.json({

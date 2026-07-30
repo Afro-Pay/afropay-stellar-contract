@@ -7,6 +7,8 @@ import sep31Router from "./routes/sep31";
 import escrowRouter from "./routes/escrow";
 import contentRouter from "./routes/content";
 import { metricsMiddleware, metricsEndpoint } from "./middleware/metrics";
+import { rateLimit } from "./middleware/rateLimit";
+import { idempotencyMiddleware } from "./middleware/idempotency";
 
 import path from "path";
 
@@ -37,6 +39,17 @@ export function buildApp(): Express {
     next();
   });
   app.options(/.*/, (_req, res) => void res.status(204).end());
+
+  // ------------------------------------------------------------------
+  // Rate limiter — uses socket IP, not X-Forwarded-For, to prevent
+  // header-spoofing bypass (Issue #28 adversarial test).
+  // ------------------------------------------------------------------
+  const windowMs = parseInt(process.env.RATE_LIMIT_WINDOW_MS ?? "60000", 10);
+  const maxRequests = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS ?? "100", 10);
+  app.use(rateLimit({ windowMs, maxRequests }));
+
+  // Idempotency key middleware for payment routes
+  app.use(mountPath(config.directPaymentServer), idempotencyMiddleware());
 
   // SEP-1: stellar.toml served as text/plain at the well-known path.
   app.get("/.well-known/stellar.toml", (_req, res) => {
