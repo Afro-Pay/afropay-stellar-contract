@@ -6,6 +6,7 @@ import sep12Router from "./routes/sep12";
 import sep31Router from "./routes/sep31";
 import escrowRouter from "./routes/escrow";
 import contentRouter from "./routes/content";
+import privacyRouter from "./routes/privacy";
 import { metricsMiddleware, metricsEndpoint } from "./middleware/metrics";
 import { rateLimit } from "./middleware/rateLimit";
 import { idempotencyMiddleware } from "./middleware/idempotency";
@@ -97,6 +98,9 @@ export function buildApp(): Express {
 
   // Content delivery routes
   app.use("/api/v1/tiers", contentRouter);
+
+  // NDPA privacy compliance routes (DSAR, erasure, consent)
+  app.use("/api/v1/privacy", privacyRouter);
 
   return app;
 }
