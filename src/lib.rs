@@ -1,17 +1,18 @@
 #![no_std]
 
 pub mod contract;
-pub mod escrow;
-pub mod oracle;
 pub mod errors;
+pub mod escrow;
 pub mod events;
 pub mod migration;
+pub mod oracle;
 
 pub use contract::RemittanceContract;
-pub use escrow::{Escrow, EscrowState};
-pub use oracle::OracleAttestation;
 pub use errors::RemittanceError;
+pub use escrow::{Escrow, EscrowState};
 pub use events::{
-    DepositEvent, ReleaseEvent, RefundEvent, OracleSubmitEvent, EventEmitter,
+    DepositEvent, DisputeRaisedEvent, DisputeResolvedEvent, EventEmitter, OracleSubmitEvent,
+    RefundEvent, ReleaseEvent,
 };
-pub use migration::{SchemaVersion, migrate, current_schema_version, set_initial_schema_version};
+pub use migration::{current_schema_version, migrate, set_initial_schema_version, SchemaVersion};
+pub use oracle::OracleAttestation;

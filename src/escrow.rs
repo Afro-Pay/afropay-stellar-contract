@@ -1,6 +1,7 @@
-use soroban_sdk::{Address, String as SorobanString, Vec};
+use soroban_sdk::{contracttype, Address, String as SorobanString, Vec};
 
 /// State of an escrow agreement
+#[contracttype]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EscrowState {
     /// Funds locked, awaiting oracle confirmation
@@ -13,9 +14,13 @@ pub enum EscrowState {
     Refunded = 3,
     /// Cancelled by sender before confirmation
     Cancelled = 4,
+    /// The sender contested delivery before the escrow timeout. Funds can only
+    /// move again through the arbiter threshold.
+    Disputed = 5,
 }
 
 /// Core escrow struct holding all remittance state
+#[contracttype]
 #[derive(Clone)]
 pub struct Escrow {
     /// Unique identifier for this escrow (UUID or sequential)
@@ -126,6 +131,14 @@ impl Escrow {
     /// Transition to Cancelled state
     pub fn cancel(&mut self, last_modified_ledger: u32) {
         self.state = EscrowState::Cancelled;
+        self.last_modified_ledger = last_modified_ledger;
+    }
+
+    /// Transition to Disputed state. Dispute metadata deliberately lives in a
+    /// separate storage entry so this established escrow encoding remains
+    /// readable after an upgrade.
+    pub fn dispute(&mut self, last_modified_ledger: u32) {
+        self.state = EscrowState::Disputed;
         self.last_modified_ledger = last_modified_ledger;
     }
 }
