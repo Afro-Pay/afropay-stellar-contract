@@ -1,13 +1,13 @@
-use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, Map, String as SorobanString, Symbol,
-    Vec, Bytes,
-};
 use crate::{
-    escrow::{Escrow, EscrowState},
-    oracle::OracleAttestation,
     errors::RemittanceError,
+    escrow::{Escrow, EscrowState},
     events::EventEmitter,
     migration,
+    oracle::OracleAttestation,
+};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, Map,
+    String as SorobanString, Symbol, Vec,
 };
 
 const USDC_ISSUER: &str = "GBBD47UZQ5PBC4GHW2REORM2HJW5AU4OT4QC5TFW76ZAYDG5ZWQGURNZ"; // Testnet USDC
@@ -30,6 +30,31 @@ pub struct ContractInfo {
     /// Contract version
     pub version: u32,
 }
+
+/// The amounts approved by arbiters for a disputed escrow. `Split` is the
+/// sender's amount; the agent receives the remainder.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolutionDecision {
+    Sender,
+    Agent,
+    Split(i128),
+}
+
+/// Immutable metadata captured when a dispute is raised. It is stored under a
+/// new key rather than appended to `Escrow`, preserving the escrow XDR layout.
+#[contracttype]
+#[derive(Clone)]
+pub struct Dispute {
+    pub evidence_hash: BytesN<32>,
+    pub raised_at: u64,
+}
+
+const KEY_ARBITERS: &str = "arbiters";
+const KEY_ARBITER_THRESHOLD: &str = "arbiter_threshold";
+const KEY_ADMIN_SIGNERS: &str = "admin_signers";
+const KEY_ADMIN_THRESHOLD: &str = "admin_threshold";
+const KEY_DISPUTES: &str = "disputes";
 
 /// Main remittance contract
 #[contract]
@@ -57,9 +82,10 @@ impl RemittanceContract {
             .set(&Symbol::new(&env, "info"), &info);
 
         // Initialize empty escrow map
-        env.storage()
-            .instance()
-            .set(&Symbol::new(&env, "escrows"), &Map::<SorobanString, Escrow>::new(&env));
+        env.storage().instance().set(
+            &Symbol::new(&env, "escrows"),
+            &Map::<SorobanString, Escrow>::new(&env),
+        );
 
         // Record the initial schema version so migrate() has a baseline.
         migration::set_initial_schema_version(&env);
@@ -130,10 +156,7 @@ impl RemittanceContract {
             agent,
             amount,
             SorobanString::from_slice(&env, USDC_CODE.as_bytes()),
-            Address::from_contract_id(
-                &env,
-                &Bytes::from_slice(&env, USDC_ISSUER.as_bytes()),
-            ),
+            Address::from_contract_id(&env, &Bytes::from_slice(&env, USDC_ISSUER.as_bytes())),
             recipient_country.clone(),
             recipient_account_hash,
             fiat_amount,
@@ -352,6 +375,209 @@ impl RemittanceContract {
         Ok(())
     }
 
+    /// Configure the initial admin multisig set. The original deployment admin
+    /// may do this once; subsequent rotations use `rotate_admin_multisig` and
+    /// therefore require the existing threshold.
+    pub fn configure_admin_multisig(
+        env: Env,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), RemittanceError> {
+        let info = load_info(&env)?;
+        if env
+            .storage()
+            .instance()
+            .has(&Symbol::new(&env, KEY_ADMIN_SIGNERS))
+        {
+            return Err(RemittanceError::InvalidEscrowState);
+        }
+        info.admin.require_auth();
+        validate_signer_set(&env, &signers, threshold)?;
+        store_admin_multisig(&env, signers, threshold);
+        Ok(())
+    }
+
+    /// Rotate governance signers. Existing M-of-N governance authorizations
+    /// must approve the rotation, preventing a single admin key from taking
+    /// over after multisig has been enabled.
+    pub fn rotate_admin_multisig(
+        env: Env,
+        approvals: Vec<Address>,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), RemittanceError> {
+        let info = load_info(&env)?;
+        require_admin_approval(&env, &info, &approvals)?;
+        validate_signer_set(&env, &signers, threshold)?;
+        store_admin_multisig(&env, signers, threshold);
+        Ok(())
+    }
+
+    /// Add an authorized arbiter. Governance authorization is a Soroban
+    /// account signature and is cryptographically bound to this invocation.
+    pub fn register_arbiter(
+        env: Env,
+        approvals: Vec<Address>,
+        arbiter: Address,
+    ) -> Result<(), RemittanceError> {
+        let info = load_info(&env)?;
+        require_admin_approval(&env, &info, &approvals)?;
+        let mut arbiters = load_address_set(&env, KEY_ARBITERS);
+        arbiters.set(arbiter, true);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, KEY_ARBITERS), &arbiters);
+        Ok(())
+    }
+
+    /// Remove an arbiter. The current threshold must remain satisfiable.
+    pub fn remove_arbiter(
+        env: Env,
+        approvals: Vec<Address>,
+        arbiter: Address,
+    ) -> Result<(), RemittanceError> {
+        let info = load_info(&env)?;
+        require_admin_approval(&env, &info, &approvals)?;
+        let mut arbiters = load_address_set(&env, KEY_ARBITERS);
+        arbiters.remove(arbiter);
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, KEY_ARBITER_THRESHOLD))
+            .unwrap_or(0);
+        if threshold > arbiters.len() {
+            return Err(RemittanceError::InvalidThreshold);
+        }
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, KEY_ARBITERS), &arbiters);
+        Ok(())
+    }
+
+    /// Set the M value required to resolve a dispute.
+    pub fn set_arbiter_threshold(
+        env: Env,
+        approvals: Vec<Address>,
+        threshold: u32,
+    ) -> Result<(), RemittanceError> {
+        let info = load_info(&env)?;
+        require_admin_approval(&env, &info, &approvals)?;
+        if threshold == 0 || threshold > load_address_set(&env, KEY_ARBITERS).len() {
+            return Err(RemittanceError::InvalidThreshold);
+        }
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, KEY_ARBITER_THRESHOLD), &threshold);
+        Ok(())
+    }
+
+    /// Raise a dispute before expiry. `escrow.sender.require_auth()` is the
+    /// sender signature: Soroban verifies it against the invocation arguments,
+    /// including the evidence hash, so a detached/replayable signature is not
+    /// accepted.
+    pub fn raise_dispute(
+        env: Env,
+        escrow_id: SorobanString,
+        evidence_hash: BytesN<32>,
+    ) -> Result<(), RemittanceError> {
+        let mut escrows = load_escrows(&env)?;
+        let mut escrow = escrows
+            .get(escrow_id.clone())
+            .ok_or(RemittanceError::EscrowNotFound)?;
+        escrow.sender.require_auth();
+        if escrow.state != EscrowState::Locked || env.ledger().sequence() >= escrow.timeout_ledger {
+            return Err(RemittanceError::InvalidEscrowState);
+        }
+
+        escrow.dispute(env.ledger().sequence());
+        escrows.set(escrow_id.clone(), escrow.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "escrows"), &escrows);
+        let mut disputes: Map<SorobanString, Dispute> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, KEY_DISPUTES))
+            .unwrap_or_else(|| Map::new(&env));
+        disputes.set(
+            escrow_id.clone(),
+            Dispute {
+                evidence_hash: evidence_hash.clone(),
+                raised_at: get_current_timestamp(&env),
+            },
+        );
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, KEY_DISPUTES), &disputes);
+        EventEmitter::emit_dispute_raised(&env, escrow_id, escrow.sender, evidence_hash);
+        Ok(())
+    }
+
+    /// Resolve a disputed escrow after M distinct registered arbiters have
+    /// supplied Soroban account authorizations. The execution transaction's
+    /// signatures are verified by the host; no unauthenticated signature bytes
+    /// are ever trusted by contract code.
+    pub fn resolve_dispute(
+        env: Env,
+        escrow_id: SorobanString,
+        arbiter_signers: Vec<Address>,
+        decision: ResolutionDecision,
+    ) -> Result<(), RemittanceError> {
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(&env, KEY_ARBITER_THRESHOLD))
+            .ok_or(RemittanceError::InvalidThreshold)?;
+        require_registered_approvals(&env, &arbiter_signers, KEY_ARBITERS, threshold, false)?;
+        let mut escrows = load_escrows(&env)?;
+        let mut escrow = escrows
+            .get(escrow_id.clone())
+            .ok_or(RemittanceError::EscrowNotFound)?;
+        if escrow.state != EscrowState::Disputed {
+            return Err(RemittanceError::InvalidEscrowState);
+        }
+        let (sender_amount, agent_amount) = resolution_amounts(&escrow, decision)?;
+        if sender_amount > 0 {
+            transfer_usdc_from_contract(&env, &escrow.sender, sender_amount)?;
+        }
+        if agent_amount > 0 {
+            transfer_usdc_from_contract(&env, &escrow.agent, agent_amount)?;
+        }
+        escrow.state = if sender_amount == escrow.amount {
+            EscrowState::Refunded
+        } else {
+            EscrowState::Released
+        };
+        escrow.last_modified_ledger = env.ledger().sequence();
+        escrow.released_at = Some(get_current_timestamp(&env));
+        escrows.set(escrow_id.clone(), escrow);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "escrows"), &escrows);
+        EventEmitter::emit_dispute_resolved(
+            &env,
+            escrow_id,
+            sender_amount,
+            agent_amount,
+            arbiter_signers.len(),
+        );
+        Ok(())
+    }
+
+    /// Swap the contract WASM after the configured admin M-of-N authorizes it.
+    /// Existing instance storage is retained by Soroban; new storage must use
+    /// compatible keys/types or be introduced through `migrate`.
+    pub fn upgrade(
+        env: Env,
+        approvals: Vec<Address>,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), RemittanceError> {
+        let info = load_info(&env)?;
+        require_admin_approval(&env, &info, &approvals)?;
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
+
     /// Apply pending schema migrations after a WASM upgrade.
     ///
     /// This entry point must be called exactly once after each WASM swap that
@@ -373,7 +599,136 @@ impl RemittanceContract {
 
 // Helper functions
 
-fn transfer_usdc_to_contract(env: &Env, from: &Address, amount: i128) -> Result<(), RemittanceError> {
+fn load_info(env: &Env) -> Result<ContractInfo, RemittanceError> {
+    env.storage()
+        .instance()
+        .get(&Symbol::new(env, "info"))
+        .ok_or(RemittanceError::NotInitialized)
+}
+
+fn load_escrows(env: &Env) -> Result<Map<SorobanString, Escrow>, RemittanceError> {
+    env.storage()
+        .instance()
+        .get(&Symbol::new(env, "escrows"))
+        .ok_or(RemittanceError::EscrowNotFound)
+}
+
+fn load_address_set(env: &Env, key: &str) -> Map<Address, bool> {
+    env.storage()
+        .instance()
+        .get(&Symbol::new(env, key))
+        .unwrap_or_else(|| Map::new(env))
+}
+
+fn validate_signer_set(
+    env: &Env,
+    signers: &Vec<Address>,
+    threshold: u32,
+) -> Result<(), RemittanceError> {
+    if threshold == 0 || signers.len() < threshold {
+        return Err(RemittanceError::InvalidThreshold);
+    }
+    let mut unique = Map::<Address, bool>::new(env);
+    for signer in signers.iter() {
+        if unique.get(signer.clone()).unwrap_or(false) {
+            return Err(RemittanceError::DuplicateSigner);
+        }
+        unique.set(signer, true);
+    }
+    Ok(())
+}
+
+fn store_admin_multisig(env: &Env, signers: Vec<Address>, threshold: u32) {
+    let mut administrators = Map::<Address, bool>::new(env);
+    for signer in signers.iter() {
+        administrators.set(signer, true);
+    }
+    env.storage()
+        .instance()
+        .set(&Symbol::new(env, KEY_ADMIN_SIGNERS), &administrators);
+    env.storage()
+        .instance()
+        .set(&Symbol::new(env, KEY_ADMIN_THRESHOLD), &threshold);
+}
+
+fn require_admin_approval(
+    env: &Env,
+    info: &ContractInfo,
+    approvals: &Vec<Address>,
+) -> Result<(), RemittanceError> {
+    if !env
+        .storage()
+        .instance()
+        .has(&Symbol::new(env, KEY_ADMIN_SIGNERS))
+    {
+        // Governance must be explicitly configured before sensitive operations
+        // (including upgrades) are available.
+        return Err(RemittanceError::AdminThresholdNotMet);
+    }
+    let threshold: u32 = env
+        .storage()
+        .instance()
+        .get(&Symbol::new(env, KEY_ADMIN_THRESHOLD))
+        .ok_or(RemittanceError::AdminThresholdNotMet)?;
+    let _ = info; // Retain the initialized-contract check at every call site.
+    require_registered_approvals(env, approvals, KEY_ADMIN_SIGNERS, threshold, true)
+}
+
+fn require_registered_approvals(
+    env: &Env,
+    approvals: &Vec<Address>,
+    registry_key: &str,
+    threshold: u32,
+    admin: bool,
+) -> Result<(), RemittanceError> {
+    if threshold == 0 || approvals.len() < threshold {
+        return Err(if admin {
+            RemittanceError::AdminThresholdNotMet
+        } else {
+            RemittanceError::ArbiterThresholdNotMet
+        });
+    }
+    let registered = load_address_set(env, registry_key);
+    let mut unique = Map::<Address, bool>::new(env);
+    for signer in approvals.iter() {
+        if unique.get(signer.clone()).unwrap_or(false) {
+            return Err(RemittanceError::DuplicateSigner);
+        }
+        if !registered.get(signer.clone()).unwrap_or(false) {
+            return Err(RemittanceError::InvalidArbiter);
+        }
+        // The host verifies the account's cryptographic authorization and binds
+        // it to this contract invocation (including ID and decision arguments).
+        signer.require_auth();
+        unique.set(signer, true);
+    }
+    Ok(())
+}
+
+fn resolution_amounts(
+    escrow: &Escrow,
+    decision: ResolutionDecision,
+) -> Result<(i128, i128), RemittanceError> {
+    let sender_amount = match decision {
+        ResolutionDecision::Sender => escrow.amount,
+        ResolutionDecision::Agent => 0,
+        ResolutionDecision::Split(amount) => amount,
+    };
+    if sender_amount < 0 || sender_amount > escrow.amount {
+        return Err(RemittanceError::InvalidResolution);
+    }
+    let agent_amount = escrow
+        .amount
+        .checked_sub(sender_amount)
+        .ok_or(RemittanceError::InvalidResolution)?;
+    Ok((sender_amount, agent_amount))
+}
+
+fn transfer_usdc_to_contract(
+    env: &Env,
+    from: &Address,
+    amount: i128,
+) -> Result<(), RemittanceError> {
     // Call USDC contract's transfer function
     // This is simplified; production uses soroban_sdk::token_client
     Ok(())
@@ -406,4 +761,50 @@ fn generate_escrow_id(env: &Env) -> SorobanString {
 
 fn get_current_timestamp(env: &Env) -> u64 {
     env.ledger().timestamp()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn disputed_escrow(env: &Env, amount: i128) -> Escrow {
+        let mut escrow = Escrow::new(
+            SorobanString::from_slice(env, b"escrow_test"),
+            Address::generate(env),
+            Address::generate(env),
+            amount,
+            SorobanString::from_slice(env, b"USDC"),
+            Address::generate(env),
+            SorobanString::from_slice(env, b"NG"),
+            Vec::new(env),
+            amount,
+            SorobanString::from_slice(env, b"NGN"),
+            1,
+            100,
+            1,
+            0,
+        );
+        escrow.dispute(2);
+        escrow
+    }
+
+    #[test]
+    fn split_resolution_preserves_escrow_amount() {
+        let env = Env::default();
+        let escrow = disputed_escrow(&env, 100);
+        assert_eq!(
+            resolution_amounts(&escrow, ResolutionDecision::Split(40)),
+            Ok((40, 60))
+        );
+    }
+
+    #[test]
+    fn resolution_rejects_oversized_split() {
+        let env = Env::default();
+        let escrow = disputed_escrow(&env, 100);
+        assert_eq!(
+            resolution_amounts(&escrow, ResolutionDecision::Split(101)),
+            Err(RemittanceError::InvalidResolution)
+        );
+    }
 }

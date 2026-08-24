@@ -44,4 +44,13 @@ pub enum RemittanceError {
 
     // Generic Errors
     OperationFailed = 26,
+
+    // Dispute and governance errors
+    InvalidArbiter = 27,
+    ArbiterThresholdNotMet = 28,
+    DuplicateSigner = 29,
+    InvalidResolution = 30,
+    InvalidEvidenceHash = 31,
+    AdminThresholdNotMet = 32,
+    InvalidThreshold = 33,
 }
