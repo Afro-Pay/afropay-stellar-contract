@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "baseUrl": ".",
+    "paths": {
+      "react": ["../../app/node_modules/react"],
+      "react-dom": ["../../app/node_modules/react-dom"],
+      "@testing-library/react": ["../../app/node_modules/@testing-library/react"]
+    }
+  },
+  "include": ["hooks", "components"]
+}

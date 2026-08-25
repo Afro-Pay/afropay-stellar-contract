@@ -7,6 +7,7 @@ import sep31Router from "./routes/sep31";
 import escrowRouter from "./routes/escrow";
 import contentRouter from "./routes/content";
 import privacyRouter from "./routes/privacy";
+import transactionRouter from "./routes/transaction";
 import { metricsMiddleware, metricsEndpoint } from "./middleware/metrics";
 import { rateLimit } from "./middleware/rateLimit";
 import { idempotencyMiddleware } from "./middleware/idempotency";
@@ -101,6 +102,10 @@ export function buildApp(): Express {
 
   // NDPA privacy compliance routes (DSAR, erasure, consent)
   app.use("/api/v1/privacy", privacyRouter);
+
+  // Transaction settlement SSE streaming routes (Issue #83)
+  app.use("/transactions", transactionRouter);
+  app.use("/api/v1/transactions", transactionRouter);
 
   return app;
 }

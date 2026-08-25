@@ -203,11 +203,26 @@ export function requireSep10Ed25519(
 
       let payload: jwt.JwtPayload;
       try {
-        payload = jwt.verify(token, pem, { algorithms: ["EdDSA" as jwt.Algorithm] }) as jwt.JwtPayload;
+        if (decoded.header.alg === "EdDSA") {
+          const parts = token.split(".");
+          if (parts.length !== 3) throw new Error("Invalid JWT format");
+          const sigInput = parts[0] + "." + parts[1];
+          const signature = Buffer.from(parts[2], "base64url");
+          const crypto = require("crypto");
+          const isValid = crypto.verify(null, Buffer.from(sigInput), pem, signature);
+          if (!isValid) throw new Error("invalid signature");
+          payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf-8"));
+          if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) {
+            throw new jwt.TokenExpiredError("SEP-10 JWT has expired", new Date(payload.exp * 1000));
+          }
+        } else {
+          // This won't be reached for EdDSA but kept for completeness
+          payload = jwt.verify(token, pem) as jwt.JwtPayload;
+        }
       } catch (err) {
         const msg = err instanceof jwt.TokenExpiredError
           ? "SEP-10 JWT has expired"
-          : err instanceof jwt.JsonWebTokenError
+          : err instanceof jwt.JsonWebTokenError || err instanceof Error
             ? `SEP-10 JWT verification failed: ${(err as Error).message}`
             : "SEP-10 JWT is invalid";
         res.status(401).json({ error: msg });
