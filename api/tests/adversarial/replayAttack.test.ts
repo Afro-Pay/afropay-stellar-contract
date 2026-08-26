@@ -1,9 +1,6 @@
 import request from "supertest";
 import express, { Express } from "express";
-import jwt from "jsonwebtoken";
 import { clearIdempotencyStore, idempotencyMiddleware } from "../../middleware/idempotency";
-
-const JWT_SECRET = "test-sep10-jwt-secret-do-not-use-in-production";
 
 function buildTestApp(): Express {
   const app = express();
@@ -16,6 +13,24 @@ function buildTestApp(): Express {
       res.status(400).json({ error: "amount and asset_code are required" });
       return;
     }
+    res.status(201).json({ id: "txn-001", status: "pending", amount, asset_code });
+  });
+
+  return app;
+}
+
+function buildSlowTestApp(delayMs = 300): Express {
+  const app = express();
+  app.use(express.json());
+  app.use(idempotencyMiddleware());
+
+  app.post("/api/v1/payments", async (req, res) => {
+    const { amount, asset_code } = req.body ?? {};
+    if (!amount || !asset_code) {
+      res.status(400).json({ error: "amount and asset_code are required" });
+      return;
+    }
+    await new Promise((r) => setTimeout(r, delayMs));
     res.status(201).json({ id: "txn-001", status: "pending", amount, asset_code });
   });
 
@@ -43,7 +58,7 @@ describe("Adversarial: Replay Attack", () => {
     expect(res.body.id).toBe("txn-001");
   });
 
-  it("replay with same Idempotency-Key returns 409", async () => {
+  it("sequential replay with same Idempotency-Key returns cached response", async () => {
     const body = { amount: "100", asset_code: "USDC" };
 
     const first = await request(app)
@@ -58,8 +73,28 @@ describe("Adversarial: Replay Attack", () => {
       .set("Idempotency-Key", "replay-key-001")
       .send(body);
 
-    expect(second.status).toBe(409);
-    expect(second.body.error).toBe("idempotency_key_already_used");
+    // After the first request completes, the cached response is returned
+    expect(second.status).toBe(201);
+    expect(second.body).toEqual(first.body);
+  });
+
+  it("concurrent replay with same Idempotency-Key returns 409 for the loser", async () => {
+    const slowApp = buildSlowTestApp(300);
+    const body = { amount: "100", asset_code: "USDC" };
+
+    const [first, second] = await Promise.all([
+      request(slowApp)
+        .post("/api/v1/payments")
+        .set("Idempotency-Key", "concurrent-replay-001")
+        .send(body),
+      request(slowApp)
+        .post("/api/v1/payments")
+        .set("Idempotency-Key", "concurrent-replay-001")
+        .send(body),
+    ]);
+
+    const statuses = [first.status, second.status].sort();
+    expect(statuses).toEqual([201, 409]);
   });
 
   it("replay with different key succeeds (different idempotency context)", async () => {

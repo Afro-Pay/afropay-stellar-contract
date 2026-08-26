@@ -9,7 +9,10 @@ import contentRouter from "./routes/content";
 import privacyRouter from "./routes/privacy";
 import { metricsMiddleware, metricsEndpoint } from "./middleware/metrics";
 import { rateLimit } from "./middleware/rateLimit";
-import { idempotencyMiddleware } from "./middleware/idempotency";
+import {
+  idempotencyMiddleware,
+  setIdempotencyRedis,
+} from "./middleware/idempotency";
 
 import path from "path";
 
@@ -17,11 +20,27 @@ import path from "path";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { version } = require(path.join(__dirname, "package.json")) as { version: string };
 
+/** Track whether Redis has already been wired for idempotency. */
+let idempotencyRedisReady = false;
+
 function mountPath(url: URL): string {
   return url.pathname.replace(/\/$/, "") || "/";
 }
 
 export function buildApp(): Express {
+  // Wire up Redis for distributed idempotency when REDIS_URL is set.
+  // Lazy-require ioredis so it is only resolved when needed.
+  if (config.redisUrl && !idempotencyRedisReady) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const Redis = require("ioredis") as { new (url: string): import("./middleware/idempotency").IdempotencyRedisClient };
+      setIdempotencyRedis(new Redis(config.redisUrl));
+      idempotencyRedisReady = true;
+    } catch {
+      console.warn("[app] ioredis not available — falling back to in-memory idempotency store");
+    }
+  }
+
   const app = express();
   app.use(express.json());
   app.use(express.urlencoded({ extended: true }));
@@ -93,7 +112,8 @@ export function buildApp(): Express {
   app.use(mountPath(config.kycServer), sep12Router);
   app.use(mountPath(config.directPaymentServer), sep31Router);
 
-  // Escrow routes (Issue #7)
+  // Escrow routes (Issue #7) — idempotency for POST endpoints
+  app.use("/api/v1/escrow", idempotencyMiddleware());
   app.use("/api/v1/escrow", escrowRouter);
 
   // Content delivery routes
