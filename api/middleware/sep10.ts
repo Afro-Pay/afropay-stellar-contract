@@ -10,9 +10,14 @@
  *  • Validates signature algorithm (EdDSA), expiry, and the `sub` (Stellar G/M key).
  *  • Rejects missing, expired, and tampered tokens with a 401 + descriptive error.
  *
+ * NOTE: jsonwebtoken v9 does not support EdDSA/Ed25519 (the underlying jwa library
+ * only handles RS/PS/ES/HS algorithms). EdDSA tokens are verified directly with
+ * Node's built-in `crypto.verify()` instead of passing them to jwt.verify().
+ *
  * No signing keys are hardcoded — all config comes from environment variables.
  */
 
+import * as nodeCrypto from "crypto";
 import { NextFunction, Request, Response } from "express";
 import https from "https";
 import http from "http";
@@ -152,7 +157,13 @@ function validateSub(sub: unknown): { account: string; memo?: string } {
  * Ed25519-based SEP-10 JWT verification middleware.
  *
  * Fetches the anchor's public key from stellar.toml (cached 1 h), then
- * verifies the JWT is signed with that key using EdDSA.
+ * verifies the JWT is signed with that key using Node's crypto.verify().
+ *
+ * jsonwebtoken v9 does not support EdDSA (its underlying jwa library only
+ * handles RS/PS/ES/HS algorithms), so we parse and verify the JWT manually:
+ *   1. Split into header.payload.signature
+ *   2. Verify the Ed25519 signature over header+"."+payload
+ *   3. Decode and validate the payload claims (exp, sub)
  *
  * Returns 401 (not 403) because the client sent credentials that did not pass
  * verification — the request must be re-authenticated.
@@ -170,11 +181,23 @@ export function requireSep10Ed25519(
   }
   const token = match[1];
 
-  // Decode header without verifying to check algorithm before fetching the key.
-  const decoded = jwt.decode(token, { complete: true });
-  if (!decoded || decoded.header.alg !== "EdDSA") {
-    // Also accept HS256 tokens issued by this same server (integration flows).
-    // If not EdDSA, fall through to shared-secret verify.
+  // Peek at the JWT header to decide which verification path to take.
+  const parts = token.split(".");
+  if (parts.length !== 3) {
+    res.status(401).json({ error: "SEP-10 JWT is invalid" });
+    return;
+  }
+
+  let jwtHeader: { alg?: string };
+  try {
+    jwtHeader = JSON.parse(Buffer.from(parts[0], "base64url").toString("utf8"));
+  } catch {
+    res.status(401).json({ error: "SEP-10 JWT is invalid" });
+    return;
+  }
+
+  if (jwtHeader.alg !== "EdDSA") {
+    // Non-EdDSA path — fall back to shared-secret HS256 verify for integration flows.
     try {
       const payload = jwt.verify(token, config.jwtSecret) as jwt.JwtPayload;
       const { account, memo } = validateSub(payload.sub);
@@ -182,35 +205,53 @@ export function requireSep10Ed25519(
       next();
       return;
     } catch {
-      res.status(401).json({ error: "invalid or expired SEP-10 JWT" });
+      res.status(401).json({ error: "SEP-10 JWT is invalid" });
       return;
     }
   }
 
-  // EdDSA path: fetch anchor key (possibly from cache) then verify.
+  // EdDSA path: fetch anchor key (possibly from cache) then verify manually.
   getAnchorPublicKey()
     .then((stellarPublicKey) => {
-      // Convert Stellar G… key to raw 32-byte Ed25519 public key in PEM form
-      // so jsonwebtoken's EdDSA support can use it.
+      // Convert the Stellar G… key to a Node KeyObject so crypto.verify can use it.
       const rawBytes = StrKey.decodeEd25519PublicKey(stellarPublicKey);
-      // Node's crypto expects the key as a KeyObject or as a PEM for EdDSA.
-      // Build a minimal SubjectPublicKeyInfo DER envelope and export as PEM.
       const spki = buildEd25519SpkiDer(rawBytes);
-      const pem =
-        "-----BEGIN PUBLIC KEY-----\n" +
-        spki.toString("base64").match(/.{1,64}/g)!.join("\n") +
-        "\n-----END PUBLIC KEY-----";
-
-      let payload: jwt.JwtPayload;
+      let keyObject: nodeCrypto.KeyObject;
       try {
-        payload = jwt.verify(token, pem, { algorithms: ["EdDSA" as jwt.Algorithm] }) as jwt.JwtPayload;
+        keyObject = nodeCrypto.createPublicKey({ key: spki, format: "der", type: "spki" });
       } catch (err) {
-        const msg = err instanceof jwt.TokenExpiredError
-          ? "SEP-10 JWT has expired"
-          : err instanceof jwt.JsonWebTokenError
-            ? `SEP-10 JWT verification failed: ${(err as Error).message}`
-            : "SEP-10 JWT is invalid";
-        res.status(401).json({ error: msg });
+        res.status(503).json({ error: `unable to parse anchor public key: ${(err as Error).message}` });
+        return;
+      }
+
+      // Verify the EdDSA signature: sign-input is the raw bytes of "header.payload".
+      const signInput = Buffer.from(`${parts[0]}.${parts[1]}`);
+      let sigBytes: Buffer;
+      try {
+        sigBytes = Buffer.from(parts[2], "base64url");
+      } catch {
+        res.status(401).json({ error: "SEP-10 JWT verification failed: malformed signature" });
+        return;
+      }
+
+      const valid = nodeCrypto.verify(null, signInput, keyObject, sigBytes);
+      if (!valid) {
+        res.status(401).json({ error: "SEP-10 JWT verification failed: signature mismatch" });
+        return;
+      }
+
+      // Signature is good — now validate the payload claims.
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+      } catch {
+        res.status(401).json({ error: "SEP-10 JWT is invalid" });
+        return;
+      }
+
+      const now = Math.floor(Date.now() / 1000);
+      if (typeof payload.exp === "number" && payload.exp < now) {
+        res.status(401).json({ error: "SEP-10 JWT has expired" });
         return;
       }
 
