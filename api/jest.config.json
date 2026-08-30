@@ -2,7 +2,7 @@
   "preset": "ts-jest",
   "testEnvironment": "node",
   "rootDir": ".",
-  "testMatch": ["**/__tests__/**/*.test.ts", "**/tests/**/*.test.ts"],
+  "testMatch": ["**/__tests__/**/*.test.ts", "**/tests/**/*.test.ts", "<rootDir>/../apps/**/*.spec.ts", "<rootDir>/../apps/**/*.test.ts"],
   "setupFiles": ["<rootDir>/jest.setup.ts"],
   "globals": {
     "ts-jest": {

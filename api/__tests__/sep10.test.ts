@@ -139,6 +139,7 @@ describe("valid EdDSA SEP-10 token", () => {
     const res = await request(app)
       .post(`/api/v1/escrow/${id}/release`)
       .set("Authorization", `Bearer ${token}`);
+    if (res.status !== 200) console.log("ERROR BODY:", res.body);
     expect(res.status).toBe(200);
     expect(res.body.state).toBe("Released");
   });
