@@ -7,6 +7,15 @@ use fees::{FeeConfig, FeeError, calculate_recipient_amount, calculate_all_fees};
 #[cfg(test)]
 mod reentrancy_tests;
 
+#[cfg(test)]
+mod test;
+
+#[cfg(test)]
+mod proptests;
+
+#[cfg(test)]
+mod adversarial_tests;
+
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct RemittanceContract;

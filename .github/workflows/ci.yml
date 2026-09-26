@@ -54,6 +54,10 @@ jobs:
       - name: Run contract tests
         run: cargo test --workspace --features testutils
 
+      - name: Run property-based tests (capped at 120s)
+        run: |
+          PROPTEST_TIMEOUT=120 cargo test --workspace --features testutils -- property_
+
       - name: Run Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
