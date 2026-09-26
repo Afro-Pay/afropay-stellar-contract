@@ -7,6 +7,15 @@ use migration::{EscrowMigrationError, migrate as run_migrate};
 #[cfg(test)]
 mod reentrancy_tests;
 
+#[cfg(test)]
+mod test;
+
+#[cfg(test)]
+mod proptests;
+
+#[cfg(test)]
+mod adversarial_tests;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum EscrowState {
