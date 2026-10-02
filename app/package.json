@@ -2,11 +2,11 @@
   "name": "afropay-web",
   "version": "0.1.0",
   "private": true,
-  "description": "AfroPay frontend — real-time escrow status timeline (Issue #24)",
+  "description": "AfroPay frontend \u2014 real-time escrow status timeline (Issue #24)",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "dev": "node init && vite",
+    "build": "node init && tsc --noEmit && vite build",
     "test": "vitest run",
     "test:e2e": "playwright test --config ../e2e/playwright.config.ts"
   },

@@ -5,7 +5,7 @@
   "description": "Stellar transaction relayer with atomic Redis-backed sequence-number reservation",
   "main": "dist/submit.js",
   "scripts": {
-    "build": "tsc",
+    "build": "node init && tsc",
     "test": "jest --runInBand --forceExit",
     "test:ci": "jest --runInBand --forceExit --ci"
   },
