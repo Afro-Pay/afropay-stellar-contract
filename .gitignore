@@ -2,8 +2,6 @@ target/
 Cargo.lock
 
 # ── Secrets & credentials ────────────────────────────────────────────────────
-.env
-.env.*
 !.env.example
 !.env.template
 
@@ -21,3 +19,4 @@ vault-init.json
 # node_modules
 node_modules/
 
+config.bat

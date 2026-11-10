@@ -5,9 +5,9 @@
   "description": "Stellar Horizon SSE listener with gap detection, catch-up replay, and idempotent event processing",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "dev": "tsc && node dist/index.js",
+    "build": "node init && tsc",
+    "start": "node init && node dist/index.js",
+    "dev": "node init && tsc && node dist/index.js",
     "test": "jest --runInBand --forceExit"
   },
   "dependencies": {

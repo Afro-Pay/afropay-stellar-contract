@@ -2,11 +2,11 @@
   "name": "afropay-oracle",
   "version": "0.1.0",
   "private": true,
-  "description": "Multi-source FX rate oracle aggregator for AfroPay — Flutterwave, CBN, Stellar DEX",
+  "description": "Multi-source FX rate oracle aggregator for AfroPay \u2014 Flutterwave, CBN, Stellar DEX",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
-    "build": "tsc",
+    "build": "node init && tsc",
     "test": "node --experimental-vm-modules node_modules/.bin/jest --runInBand --forceExit",
     "test:ci": "node --experimental-vm-modules node_modules/.bin/jest --runInBand --forceExit --ci"
   },
@@ -25,7 +25,9 @@
     "testMatch": [
       "**/tests/**/*.test.ts"
     ],
-    "extensionsToTreatAsEsm": [".ts"],
+    "extensionsToTreatAsEsm": [
+      ".ts"
+    ],
     "moduleNameMapper": {
       "^(\\.{1,2}/.*)\\.js$": "$1"
     },
